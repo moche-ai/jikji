@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      INFRA_TELEMETRY: 'off'   # never touch a network sink in CI
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm ci
+      - name: node --test (increment-1 security evidence)
+        run: node --test
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: gitleaks (OSS image, pinned by digest for deterministic rules)
+        run: |
+          docker run --rm -v "$PWD:/repo" \
+            ghcr.io/gitleaks/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f \
+            detect --source /repo --redact -v --exit-code 1
+
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: clean-room + internal-leak guard
+        run: |
+          set -e
+          # 1) No internal absolute paths, the private monorepo name, or the proprietary
+          #    memory-service path in ANY tracked file (git grep = exactly what is committed).
+          # Exclude .github/ itself: these guard patterns necessarily appear in this workflow file.
+          # Secrets in workflow files are still covered by the gitleaks job.
+          if git grep -nIiE '/srv/jikji|core/curator|identity-app' -- . ':!.github/' ; then
+            echo "::error::internal path / private-repo / proprietary-service reference leaked into a committed file"; exit 1
+          fi
+          # 2) Internal strategy docs and the handoff must never be committed.
+          if git ls-files | grep -E '(^|/)docs/internal/|(^|/)HANDOFF\.md$' ; then
+            echo "::error::internal docs / HANDOFF committed"; exit 1
+          fi

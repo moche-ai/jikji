@@ -1,0 +1,488 @@
+// jikji/store.mjs — Jikji 메모리 스토어 (node:sqlite, 정본 물리 모델)
+//
+// 정본: the internal design spec + the internal design spec(일관성)·§2(격리).
+// Codex 코드검토 r1 반영: 복합 FK CASCADE(P0-5) · expected_version CAS(P0-1) · outbox consumer(P0-3) ·
+//   forget cascade + 전 저장소 0참조(P0-4) · 원자 seq/tx(P1-1) · status/moderation CHECK(P1-3).
+//
+// 불변:
+//  - 유효상태(fact_revisions.status) ≠ 검열상태(moderation.state) 분리 축.
+//  - 모든 조회/수정/삭제는 (namespace_id, id) 복합키 — namespace 는 인증 키에서만 도출(IDOR).
+//  - DB 핸들 미노출 — openStore() 는 repository capability(메서드)만 반환.
+//  - 쓰기는 BEGIN IMMEDIATE. 파생(임베딩)은 outbox consumer 만 수행(승인 후, 실패 시 pending 유지).
+//  - clean-room: 어떤 내부/독점 메모리 서비스 코드도 미참조(PROVENANCE.md).
+
+import { DatabaseSync } from 'node:sqlite';
+import crypto from 'node:crypto';
+
+const SCHEMA_VERSION = 1;
+
+function newId(prefix) { return `${prefix}_${crypto.randomBytes(16).toString('hex')}`; }
+function contentHash(text) { return crypto.createHash('sha256').update(String(text ?? '')).digest('hex'); }
+
+const DDL = `
+PRAGMA journal_mode = WAL;
+PRAGMA foreign_keys = ON;
+PRAGMA secure_delete = ON;
+PRAGMA busy_timeout = 5000;
+PRAGMA synchronous = NORMAL;
+
+CREATE TABLE IF NOT EXISTS namespaces (
+  namespace_id TEXT PRIMARY KEY,
+  owner_scope  TEXT NOT NULL,
+  policy_json  TEXT NOT NULL DEFAULT '{}',
+  created_at   INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS api_keys (
+  key_id       TEXT PRIMARY KEY,
+  key_prefix   TEXT NOT NULL,
+  key_hash     TEXT NOT NULL UNIQUE,
+  namespace_id TEXT NOT NULL REFERENCES namespaces(namespace_id),
+  scopes       TEXT NOT NULL,
+  created_at   INTEGER NOT NULL,
+  expires_at   INTEGER,
+  last_used_at INTEGER,
+  rotated_from TEXT,
+  revoked_at   INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS facts (
+  namespace_id     TEXT NOT NULL,
+  fact_id          TEXT NOT NULL,
+  head_revision_id TEXT,
+  version          INTEGER NOT NULL DEFAULT 0,
+  kind             TEXT NOT NULL DEFAULT 'semantic',
+  scope_kind       TEXT NOT NULL DEFAULT 'user' CHECK (scope_kind IN ('user','workspace','project','session')),
+  scope_ref        TEXT,
+  created_at       INTEGER NOT NULL,
+  PRIMARY KEY (namespace_id, fact_id)
+);
+
+CREATE TABLE IF NOT EXISTS fact_revisions (
+  namespace_id  TEXT NOT NULL,
+  revision_id   TEXT NOT NULL,
+  fact_id       TEXT NOT NULL,
+  text          TEXT NOT NULL,
+  valid_from    INTEGER,
+  valid_to      INTEGER,
+  recorded_at   INTEGER NOT NULL,
+  retracted_at  INTEGER,
+  status        TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','disputed','superseded','retracted')),
+  base_version  INTEGER NOT NULL DEFAULT 0,
+  author_type   TEXT NOT NULL CHECK (author_type IN ('self','assistant','third_party','external')),
+  provenance    TEXT,
+  source_ref    TEXT,
+  fact_confidence REAL,
+  embedder_ver  TEXT,
+  content_hash  TEXT NOT NULL,
+  PRIMARY KEY (namespace_id, revision_id),
+  FOREIGN KEY (namespace_id, fact_id) REFERENCES facts(namespace_id, fact_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_rev_fact ON fact_revisions(namespace_id, fact_id);
+CREATE INDEX IF NOT EXISTS idx_rev_valid ON fact_revisions(namespace_id, fact_id, valid_from, valid_to);
+
+CREATE TABLE IF NOT EXISTS revision_supersedes (
+  namespace_id           TEXT NOT NULL,
+  revision_id            TEXT NOT NULL,
+  superseded_revision_id TEXT NOT NULL,
+  PRIMARY KEY (namespace_id, revision_id, superseded_revision_id),
+  FOREIGN KEY (namespace_id, revision_id) REFERENCES fact_revisions(namespace_id, revision_id) ON DELETE CASCADE,
+  FOREIGN KEY (namespace_id, superseded_revision_id) REFERENCES fact_revisions(namespace_id, revision_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS conflict_sets (
+  namespace_id TEXT NOT NULL, set_id TEXT NOT NULL, created_at INTEGER NOT NULL,
+  PRIMARY KEY (namespace_id, set_id)
+);
+CREATE TABLE IF NOT EXISTS conflict_members (
+  namespace_id TEXT NOT NULL, set_id TEXT NOT NULL, revision_id TEXT NOT NULL,
+  PRIMARY KEY (namespace_id, set_id, revision_id),
+  FOREIGN KEY (namespace_id, revision_id) REFERENCES fact_revisions(namespace_id, revision_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS moderation (
+  namespace_id TEXT NOT NULL,
+  revision_id  TEXT NOT NULL,
+  state        TEXT NOT NULL DEFAULT 'pending_review' CHECK (state IN ('pending_review','approved','quarantined','rejected')),
+  risk_flags   TEXT,
+  reviewed_by  TEXT,
+  reviewed_at  INTEGER,
+  expires_at   INTEGER,
+  PRIMARY KEY (namespace_id, revision_id),
+  FOREIGN KEY (namespace_id, revision_id) REFERENCES fact_revisions(namespace_id, revision_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_mod_state ON moderation(namespace_id, state);
+
+-- 이벤트: fact 삭제 시 함께 purge (활성계층). 삭제 감사는 deletion_receipt+audit_log(가명)에.
+CREATE TABLE IF NOT EXISTS fact_events (
+  namespace_id TEXT NOT NULL,
+  seq          INTEGER NOT NULL,
+  fact_id      TEXT NOT NULL,
+  revision_id  TEXT,
+  type         TEXT NOT NULL,
+  at           INTEGER NOT NULL,
+  PRIMARY KEY (namespace_id, seq),
+  FOREIGN KEY (namespace_id, fact_id) REFERENCES facts(namespace_id, fact_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS fact_commands (
+  namespace_id    TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  request_hash    TEXT NOT NULL,
+  first_response  TEXT NOT NULL,
+  created_at      INTEGER NOT NULL,
+  PRIMARY KEY (namespace_id, idempotency_key)
+);
+
+CREATE TABLE IF NOT EXISTS outbox (
+  namespace_id       TEXT NOT NULL,
+  outbox_id          TEXT NOT NULL,
+  derivation_type    TEXT NOT NULL,
+  revision_id        TEXT NOT NULL,
+  derivation_version INTEGER NOT NULL DEFAULT 1,
+  payload_ref        TEXT,
+  status             TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','leased','done','dead')),
+  lease_until        INTEGER,
+  attempt            INTEGER NOT NULL DEFAULT 0,
+  next_retry_at      INTEGER,
+  dead_letter        INTEGER NOT NULL DEFAULT 0,
+  created_at         INTEGER NOT NULL,
+  PRIMARY KEY (namespace_id, outbox_id),
+  UNIQUE (namespace_id, revision_id, derivation_type, derivation_version),
+  FOREIGN KEY (namespace_id, revision_id) REFERENCES fact_revisions(namespace_id, revision_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox(namespace_id, status);
+
+CREATE TABLE IF NOT EXISTS fact_vectors (
+  namespace_id TEXT NOT NULL,
+  revision_id  TEXT NOT NULL,
+  dim          INTEGER NOT NULL,
+  vector       BLOB NOT NULL,
+  embedder_id  TEXT NOT NULL,
+  embedder_ver TEXT NOT NULL,
+  PRIMARY KEY (namespace_id, revision_id),
+  FOREIGN KEY (namespace_id, revision_id) REFERENCES fact_revisions(namespace_id, revision_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS entities (
+  namespace_id TEXT NOT NULL, entity_id TEXT NOT NULL, name TEXT NOT NULL, kind TEXT, provenance TEXT,
+  PRIMARY KEY (namespace_id, entity_id)
+);
+CREATE TABLE IF NOT EXISTS edges (
+  namespace_id TEXT NOT NULL, src_id TEXT NOT NULL, dst_id TEXT NOT NULL, rel TEXT NOT NULL, weight REAL NOT NULL DEFAULT 1.0,
+  PRIMARY KEY (namespace_id, src_id, dst_id, rel)
+);
+
+CREATE TABLE IF NOT EXISTS search_params (
+  namespace_id TEXT PRIMARY KEY, k INTEGER NOT NULL DEFAULT 8, rerank_threshold REAL NOT NULL DEFAULT 0.5, scope_weights TEXT NOT NULL DEFAULT '{}'
+);
+CREATE TABLE IF NOT EXISTS imports (
+  namespace_id TEXT NOT NULL, import_id TEXT NOT NULL, source TEXT NOT NULL, mapping TEXT, at INTEGER NOT NULL,
+  PRIMARY KEY (namespace_id, import_id)
+);
+CREATE TABLE IF NOT EXISTS consent_events (
+  namespace_id TEXT NOT NULL, seq INTEGER NOT NULL, subject TEXT NOT NULL, purpose TEXT NOT NULL,
+  action TEXT NOT NULL, notice_version INTEGER NOT NULL, source TEXT, occurred_at INTEGER NOT NULL,
+  PRIMARY KEY (namespace_id, seq)
+);
+CREATE TABLE IF NOT EXISTS raw_snapshots (
+  namespace_id TEXT NOT NULL, snapshot_id TEXT NOT NULL, wrapped_dek BLOB, ciphertext BLOB, expires_at INTEGER,
+  PRIMARY KEY (namespace_id, snapshot_id)
+);
+
+CREATE TABLE IF NOT EXISTS deletion_job (
+  namespace_id TEXT NOT NULL, job_id TEXT NOT NULL, reason TEXT, fact_ref TEXT, requested_at INTEGER NOT NULL,
+  PRIMARY KEY (namespace_id, job_id)
+);
+CREATE TABLE IF NOT EXISTS deletion_target (
+  namespace_id TEXT NOT NULL, job_id TEXT NOT NULL, store TEXT NOT NULL, state TEXT NOT NULL, ref TEXT, updated_at INTEGER NOT NULL,
+  PRIMARY KEY (namespace_id, job_id, store)
+);
+CREATE TABLE IF NOT EXISTS deletion_receipt (
+  namespace_id TEXT NOT NULL, job_id TEXT NOT NULL, object_versions TEXT, retention_deadline INTEGER, evidence TEXT, finalized_at INTEGER,
+  PRIMARY KEY (namespace_id, job_id)
+);
+
+CREATE TABLE IF NOT EXISTS audit_log (
+  namespace_id TEXT NOT NULL, seq INTEGER NOT NULL, action TEXT NOT NULL, actor_pseudonym TEXT, meta TEXT, at INTEGER NOT NULL,
+  PRIMARY KEY (namespace_id, seq)
+);
+`;
+
+export const STATUS = Object.freeze({ ACTIVE: 'active', DISPUTED: 'disputed', SUPERSEDED: 'superseded', RETRACTED: 'retracted' });
+export const MOD = Object.freeze({ PENDING: 'pending_review', APPROVED: 'approved', QUARANTINED: 'quarantined', REJECTED: 'rejected' });
+
+/** 활성계층 삭제 대상 저장소(0참조 검증에 모두 카운트). */
+const ACTIVE_STORES = ['facts', 'fact_revisions', 'fact_vectors', 'outbox', 'moderation', 'revision_supersedes', 'conflict_members', 'fact_events'];
+
+export function openStore(dbPath) {
+  const db = new DatabaseSync(dbPath);
+  db.exec(DDL);
+  const uv = db.prepare('PRAGMA user_version').get()?.user_version ?? 0;
+  if (uv < SCHEMA_VERSION) db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+  // 방어적 마이그레이션(pre-deploy dev DB): base_version 컬럼 부재 시 추가(기본 0, 안전).
+  // FK 추가는 SQLite ALTER 불가 → fresh DB 에서만 완비. 프로덕션 jikji.db 는 v1 로 신규 생성(README).
+  if (!db.prepare('PRAGMA table_info(fact_revisions)').all().some((c) => c.name === 'base_version')) {
+    db.exec('ALTER TABLE fact_revisions ADD COLUMN base_version INTEGER NOT NULL DEFAULT 0');
+  }
+
+  // 모든 논리 쓰기는 BEGIN IMMEDIATE (seq 할당·insert 원자화, P1-1).
+  function tx(fn) {
+    db.exec('BEGIN IMMEDIATE');
+    try { const r = fn(); db.exec('COMMIT'); return r; }
+    catch (e) { try { db.exec('ROLLBACK'); } catch { /* noop */ } throw e; }
+  }
+  const seqIn = (table, ns) => (db.prepare(`SELECT COALESCE(MAX(seq),0)+1 AS n FROM ${table} WHERE namespace_id=?`).get(ns)?.n) ?? 1;
+
+  // ── namespace / keys ──
+  function ensureNamespace(namespaceId, ownerScope, policy = {}) {
+    db.prepare(`INSERT INTO namespaces(namespace_id,owner_scope,policy_json,created_at) VALUES(?,?,?,?)
+                ON CONFLICT(namespace_id) DO NOTHING`).run(namespaceId, ownerScope, JSON.stringify(policy), Date.now());
+    return getNamespace(namespaceId);
+  }
+  function getNamespace(namespaceId) {
+    const r = db.prepare('SELECT * FROM namespaces WHERE namespace_id=?').get(namespaceId);
+    if (r) r.policy = JSON.parse(r.policy_json || '{}');
+    return r || null;
+  }
+  function insertApiKey({ keyId, keyPrefix, keyHash, namespaceId, scopes, expiresAt = null, rotatedFrom = null }) {
+    db.prepare(`INSERT INTO api_keys(key_id,key_prefix,key_hash,namespace_id,scopes,created_at,expires_at,rotated_from)
+                VALUES(?,?,?,?,?,?,?,?)`).run(keyId, keyPrefix, keyHash, namespaceId, scopes.join(','), Date.now(), expiresAt, rotatedFrom);
+  }
+  function resolveKey(keyHash) {
+    const r = db.prepare('SELECT * FROM api_keys WHERE key_hash=?').get(keyHash);
+    if (!r || r.revoked_at || (r.expires_at && r.expires_at < Date.now())) return null;
+    db.prepare('UPDATE api_keys SET last_used_at=? WHERE key_id=?').run(Date.now(), r.key_id);
+    return { keyId: r.key_id, namespaceId: r.namespace_id, scopes: (r.scopes || '').split(',').filter(Boolean) };
+  }
+
+  // ── head CAS (expected_version, P0-1) — tx 안에서만 ──
+  function setHeadCAS(ns, factId, revisionId, expectedVersion) {
+    const upd = db.prepare(
+      'UPDATE facts SET head_revision_id=?, version=version+1 WHERE namespace_id=? AND fact_id=? AND version=?',
+    ).run(revisionId, ns, factId, expectedVersion);
+    if (upd.changes !== 1) { const e = new Error('version_conflict'); e.code = 409; throw e; }
+  }
+  function enqueueOutbox(ns, revisionId, derivationType, derivationVersion = 1) {
+    db.prepare(`INSERT INTO outbox(namespace_id,outbox_id,derivation_type,revision_id,derivation_version,status,created_at)
+                VALUES(?,?,?,?,?,?,?) ON CONFLICT(namespace_id,revision_id,derivation_type,derivation_version) DO NOTHING`)
+      .run(ns, newId('ob'), derivationType, revisionId, derivationVersion, 'pending', Date.now());
+  }
+
+  // ── WRITE (멱등 + revision + moderation + event + [승인시 head CAS + outbox], 단일 IMMEDIATE tx) ──
+  //  authorType/moderationState 는 core(서버)가 봉인해 전달. create=신규 fact(version 0→1),
+  //  update=factId+expectedVersion 필수(낙관적 동시성).
+  function writeFact(ns, {
+    factId = null, text, kind = 'semantic', scopeKind = 'user', scopeRef = null,
+    authorType, provenance = null, sourceRef = null, factConfidence = null,
+    validFrom = null, validTo = null, moderationState, riskFlags = null,
+    expectedVersion = null, idempotencyKey = null, requestHash = null,
+  }) {
+    return tx(() => {
+      if (idempotencyKey) {
+        const prev = db.prepare('SELECT request_hash, first_response FROM fact_commands WHERE namespace_id=? AND idempotency_key=?').get(ns, idempotencyKey);
+        if (prev) {
+          if (prev.request_hash !== requestHash) { const e = new Error('idempotency_conflict'); e.code = 409; throw e; }
+          return { ...JSON.parse(prev.first_response), idempotent_replay: true };
+        }
+      }
+      const now = Date.now();
+      const isUpdate = Boolean(factId) && Boolean(db.prepare('SELECT 1 FROM facts WHERE namespace_id=? AND fact_id=?').get(ns, factId));
+      const fid = factId || newId('fact');
+      const rid = newId('rev');
+      let baseVersion;
+      if (isUpdate) {
+        if (expectedVersion === null || expectedVersion === undefined) { const e = new Error('expected_version_required'); e.code = 428; throw e; }
+        // 제출 시점 검증(P0-1): expectedVersion 이 현재 head version 과 일치해야 — 미래/과거 값 예약 방지.
+        const cur = db.prepare('SELECT version FROM facts WHERE namespace_id=? AND fact_id=?').get(ns, factId).version;
+        if (expectedVersion !== cur) { const e = new Error('version_conflict'); e.code = 409; throw e; }
+        baseVersion = expectedVersion;
+      } else {
+        db.prepare(`INSERT INTO facts(namespace_id,fact_id,head_revision_id,version,kind,scope_kind,scope_ref,created_at)
+                    VALUES(?,?,?,?,?,?,?,?)`).run(ns, fid, null, 0, kind, scopeKind, scopeRef, now);
+        baseVersion = 0;
+      }
+      db.prepare(`INSERT INTO fact_revisions(namespace_id,revision_id,fact_id,text,valid_from,valid_to,recorded_at,
+                    status,base_version,author_type,provenance,source_ref,fact_confidence,content_hash)
+                  VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(ns, rid, fid, text, validFrom, validTo, now, STATUS.ACTIVE, baseVersion, authorType, provenance, sourceRef, factConfidence, contentHash(text));
+      db.prepare('INSERT INTO moderation(namespace_id,revision_id,state,risk_flags) VALUES(?,?,?,?)')
+        .run(ns, rid, moderationState, riskFlags ? JSON.stringify(riskFlags) : null);
+
+      if (moderationState === MOD.APPROVED) {
+        setHeadCAS(ns, fid, rid, baseVersion);          // pending/quarantine 은 head 미갱신
+        enqueueOutbox(ns, rid, 'embedding');            // 임베딩은 outbox consumer 가(P0-3)
+      }
+      db.prepare('INSERT INTO fact_events(namespace_id,seq,fact_id,revision_id,type,at) VALUES(?,?,?,?,?,?)')
+        .run(ns, seqIn('fact_events', ns), fid, rid, 'write', now);
+
+      const res = { fact_id: fid, revision_id: rid, status: STATUS.ACTIVE, moderation: moderationState, version: moderationState === MOD.APPROVED ? baseVersion + 1 : baseVersion };
+      if (idempotencyKey) db.prepare('INSERT INTO fact_commands(namespace_id,idempotency_key,request_hash,first_response,created_at) VALUES(?,?,?,?,?)')
+        .run(ns, idempotencyKey, requestHash, JSON.stringify(res), now);
+      return res;
+    });
+  }
+
+  // ── outbox 임베딩 consumer (P0-3): lease → embedFn → putVector + done, 단일 tx. 실패 시 pending 유지 ──
+  //  embedFn(text) → { dim, buf, embedderId, embedderVer }  (동기; core 가 주입)
+  function processEmbeddings(ns, embedFn, { max = 100, leaseMs = 30000 } = {}) {
+    const now0 = Date.now();
+    // 후보 = pending + **만료된 leased 회수**(crash 복구) + next_retry_at 도달분(P0-3, P1 next_retry).
+    const cand = db.prepare(`SELECT outbox_id FROM outbox WHERE namespace_id=? AND derivation_type='embedding'
+        AND (status='pending' OR (status='leased' AND lease_until < ?))
+        AND (next_retry_at IS NULL OR next_retry_at <= ?) LIMIT ?`).all(ns, now0, now0, max);
+    let done = 0;
+    for (const { outbox_id } of cand) {
+      // 원자적 lease claim(pending 또는 만료 leased). changes!==1 이면 남이 가져감.
+      const claim = db.prepare(`UPDATE outbox SET status='leased', lease_until=?, attempt=attempt+1
+          WHERE namespace_id=? AND outbox_id=? AND (status='pending' OR (status='leased' AND lease_until < ?))`)
+        .run(now0 + leaseMs, ns, outbox_id, now0);
+      if (claim.changes !== 1) continue;
+      const row = db.prepare(`SELECT o.revision_id, r.text FROM outbox o JOIN fact_revisions r
+                                ON r.namespace_id=o.namespace_id AND r.revision_id=o.revision_id
+                               WHERE o.namespace_id=? AND o.outbox_id=?`).get(ns, outbox_id);
+      try {
+        const { dim, buf, embedderId, embedderVer } = embedFn(row.text);
+        tx(() => {
+          db.prepare(`INSERT INTO fact_vectors(namespace_id,revision_id,dim,vector,embedder_id,embedder_ver)
+                      VALUES(?,?,?,?,?,?) ON CONFLICT(namespace_id,revision_id) DO UPDATE SET
+                        dim=excluded.dim, vector=excluded.vector, embedder_id=excluded.embedder_id, embedder_ver=excluded.embedder_ver`)
+            .run(ns, row.revision_id, dim, buf, embedderId, embedderVer);
+          db.prepare("UPDATE outbox SET status='done' WHERE namespace_id=? AND outbox_id=? AND status='leased'").run(ns, outbox_id);
+        });
+        done++;
+      } catch {
+        // lease 해제 → pending 복귀(재시도). attempt 상한 초과 시 dead-letter 는 후속.
+        db.prepare("UPDATE outbox SET status='pending', next_retry_at=? WHERE namespace_id=? AND outbox_id=? AND status='leased'").run(Date.now() + 5000, ns, outbox_id);
+      }
+    }
+    return { processed: done };
+  }
+
+  // ── moderation 결정 ──
+  function decideModeration(ns, revisionId, state, reviewedBy = 'policy') {
+    return tx(() => {
+      // 승인 시 write 시점의 base_version 으로 CAS — 그 사이 fact 가 진행됐으면 stale 로 409(P0-1).
+      const rev = db.prepare('SELECT fact_id, base_version FROM fact_revisions WHERE namespace_id=? AND revision_id=?').get(ns, revisionId);
+      if (!rev) { const e = new Error('revision_not_found'); e.code = 404; throw e; }
+      db.prepare('UPDATE moderation SET state=?, reviewed_by=?, reviewed_at=? WHERE namespace_id=? AND revision_id=?').run(state, reviewedBy, Date.now(), ns, revisionId);
+      if (state === MOD.APPROVED) { setHeadCAS(ns, rev.fact_id, revisionId, rev.base_version); enqueueOutbox(ns, revisionId, 'embedding'); }
+      return { revision_id: revisionId, moderation: state };
+    });
+  }
+
+  // ── 무효화(철회) = 새 retracted revision (head CAS) ──
+  function retractFact(ns, factId, reason = null) {
+    return tx(() => {
+      const f = db.prepare('SELECT version, head_revision_id FROM facts WHERE namespace_id=? AND fact_id=?').get(ns, factId);
+      if (!f) { const e = new Error('fact_not_found'); e.code = 404; throw e; }
+      const now = Date.now(); const rid = newId('rev');
+      const prev = f.head_revision_id ? db.prepare('SELECT text, author_type FROM fact_revisions WHERE namespace_id=? AND revision_id=?').get(ns, f.head_revision_id) : null;
+      db.prepare(`INSERT INTO fact_revisions(namespace_id,revision_id,fact_id,text,recorded_at,retracted_at,status,author_type,provenance,content_hash)
+                  VALUES(?,?,?,?,?,?,?,?,?,?)`).run(ns, rid, factId, prev?.text ?? '', now, now, STATUS.RETRACTED, prev?.author_type ?? 'self', reason, contentHash(prev?.text ?? ''));
+      db.prepare('INSERT INTO moderation(namespace_id,revision_id,state) VALUES(?,?,?)').run(ns, rid, MOD.APPROVED);
+      setHeadCAS(ns, factId, rid, f.version);
+      db.prepare('INSERT INTO fact_events(namespace_id,seq,fact_id,revision_id,type,at) VALUES(?,?,?,?,?,?)').run(ns, seqIn('fact_events', ns), factId, rid, 'retract', now);
+      return { fact_id: factId, revision_id: rid, status: STATUS.RETRACTED };
+    });
+  }
+
+  function confirmRevision(ns, revisionId) {
+    return tx(() => {
+      const rev = db.prepare('SELECT fact_id FROM fact_revisions WHERE namespace_id=? AND revision_id=?').get(ns, revisionId);
+      if (!rev) return { ok: false };
+      db.prepare('INSERT INTO fact_events(namespace_id,seq,fact_id,revision_id,type,at) VALUES(?,?,?,?,?,?)').run(ns, seqIn('fact_events', ns), rev.fact_id, revisionId, 'confirm', Date.now());
+      return { ok: true };
+    });
+  }
+
+  // ── 조회 (전부 namespace 복합키) ──
+  function getHead(ns, factId) {
+    return db.prepare(`SELECT r.* FROM facts f JOIN fact_revisions r ON r.namespace_id=f.namespace_id AND r.revision_id=f.head_revision_id
+                       WHERE f.namespace_id=? AND f.fact_id=?`).get(ns, factId) || null;
+  }
+  function listActive(ns, { limit = 50, offset = 0 } = {}) {
+    return db.prepare(`SELECT r.fact_id, r.revision_id, r.text, r.status, r.fact_confidence, r.recorded_at
+                       FROM facts f JOIN fact_revisions r ON r.namespace_id=f.namespace_id AND r.revision_id=f.head_revision_id
+                       WHERE f.namespace_id=? AND r.status=? ORDER BY r.recorded_at DESC LIMIT ? OFFSET ?`).all(ns, STATUS.ACTIVE, limit, offset);
+  }
+  /** 검색 후보 = active head + moderation approved (quarantine/pending 제외). scopeKind 필터 옵션. */
+  function activeApprovedRevisions(ns, { scopeKind = null } = {}) {
+    const base = `SELECT r.fact_id, r.revision_id, r.text, r.fact_confidence, f.scope_kind, f.scope_ref
+                    FROM facts f
+                    JOIN fact_revisions r ON r.namespace_id=f.namespace_id AND r.revision_id=f.head_revision_id
+                    JOIN moderation m ON m.namespace_id=r.namespace_id AND m.revision_id=r.revision_id
+                   WHERE f.namespace_id=? AND r.status=? AND m.state=?`;
+    if (scopeKind) return db.prepare(base + ' AND f.scope_kind=?').all(ns, STATUS.ACTIVE, MOD.APPROVED, scopeKind);
+    return db.prepare(base).all(ns, STATUS.ACTIVE, MOD.APPROVED);
+  }
+  function getVector(ns, revisionId) {
+    return db.prepare('SELECT dim, vector FROM fact_vectors WHERE namespace_id=? AND revision_id=?').get(ns, revisionId) || null;
+  }
+
+  // ── 삭제: DELETE facts → FK CASCADE(전 파생) + 전 저장소 0참조 검증(P0-4). 백업 상태 분리 ──
+  function forgetFact(ns, factId, reason = null) {
+    return tx(() => {
+      const exists = db.prepare('SELECT 1 FROM facts WHERE namespace_id=? AND fact_id=?').get(ns, factId);
+      if (!exists) { const e = new Error('fact_not_found'); e.code = 404; throw e; }
+      const now = Date.now(); const jobId = newId('del');
+      // 리비전 ID 고정(receipt lineage — 가명). 본문 미보관.
+      const revIds = db.prepare('SELECT revision_id FROM fact_revisions WHERE namespace_id=? AND fact_id=?').all(ns, factId).map(r => r.revision_id);
+      db.prepare('INSERT INTO deletion_job(namespace_id,job_id,reason,fact_ref,requested_at) VALUES(?,?,?,?,?)')
+        .run(ns, jobId, reason, contentHash(factId).slice(0, 16), now);
+      // FK CASCADE 로 fact_revisions→(vectors·outbox·moderation·supersedes·conflict) + fact_events 모두 삭제
+      db.prepare('DELETE FROM facts WHERE namespace_id=? AND fact_id=?').run(ns, factId);
+      const refs = countActiveRefs(ns, factId, revIds);
+      const verified = refs === 0;
+      for (const store of ACTIVE_STORES) {
+        db.prepare('INSERT INTO deletion_target(namespace_id,job_id,store,state,ref,updated_at) VALUES(?,?,?,?,?,?)')
+          .run(ns, jobId, store, verified ? 'active_verified' : 'active_purged', contentHash(factId).slice(0, 16), now);
+      }
+      db.prepare('INSERT INTO deletion_target(namespace_id,job_id,store,state,ref,updated_at) VALUES(?,?,?,?,?,?)')
+        .run(ns, jobId, 'backup', 'backup_pending_expiry', contentHash(factId).slice(0, 16), now);
+      db.prepare('INSERT INTO deletion_receipt(namespace_id,job_id,object_versions,retention_deadline,evidence) VALUES(?,?,?,?,?)')
+        .run(ns, jobId, JSON.stringify({ revision_count: revIds.length }), now + 30 * 86400_000, JSON.stringify({ active_refs: refs }));
+      // 감사(가명) — 원본 fact_id 미기록
+      db.prepare('INSERT INTO audit_log(namespace_id,seq,action,actor_pseudonym,meta,at) VALUES(?,?,?,?,?,?)')
+        .run(ns, seqIn('audit_log', ns), 'memory.forget', null, JSON.stringify({ active_verified: verified }), now);
+      return { fact_id: factId, job_id: jobId, active_verified: verified, active_refs: refs };
+    });
+  }
+
+  /** 활성계층 전 저장소에 factId/그 리비전 참조가 남았나(0 이어야 함). */
+  function countActiveRefs(ns, factId, revIds = null) {
+    const rids = revIds || db.prepare('SELECT revision_id FROM fact_revisions WHERE namespace_id=? AND fact_id=?').all(ns, factId).map(r => r.revision_id);
+    let n = 0;
+    n += db.prepare('SELECT COUNT(*) c FROM facts WHERE namespace_id=? AND fact_id=?').get(ns, factId).c;
+    n += db.prepare('SELECT COUNT(*) c FROM fact_revisions WHERE namespace_id=? AND fact_id=?').get(ns, factId).c;
+    n += db.prepare('SELECT COUNT(*) c FROM fact_events WHERE namespace_id=? AND fact_id=?').get(ns, factId).c;
+    for (const rid of rids) {
+      for (const t of ['fact_vectors', 'outbox', 'moderation', 'conflict_members']) {
+        n += db.prepare(`SELECT COUNT(*) c FROM ${t} WHERE namespace_id=? AND revision_id=?`).get(ns, rid).c;
+      }
+      // revision_supersedes: 순방향(revision_id) + 역참조(superseded_revision_id) 둘 다(P0-4)
+      n += db.prepare('SELECT COUNT(*) c FROM revision_supersedes WHERE namespace_id=? AND (revision_id=? OR superseded_revision_id=?)').get(ns, rid, rid).c;
+    }
+    return n;
+  }
+
+  // ── 감사 / 동의 (원자 seq) ──
+  function audit(ns, action, actorPseudonym = null, meta = null) {
+    tx(() => db.prepare('INSERT INTO audit_log(namespace_id,seq,action,actor_pseudonym,meta,at) VALUES(?,?,?,?,?,?)')
+      .run(ns, seqIn('audit_log', ns), action, actorPseudonym, meta ? JSON.stringify(meta) : null, Date.now()));
+  }
+  function recordConsent(ns, subject, purpose, action, noticeVersion, source = null) {
+    tx(() => db.prepare('INSERT INTO consent_events(namespace_id,seq,subject,purpose,action,notice_version,source,occurred_at) VALUES(?,?,?,?,?,?,?,?)')
+      .run(ns, seqIn('consent_events', ns), subject, purpose, action, noticeVersion, source, Date.now()));
+  }
+
+  function close() { db.close(); }
+
+  return {
+    SCHEMA_VERSION, contentHash,
+    ensureNamespace, getNamespace, insertApiKey, resolveKey,
+    writeFact, processEmbeddings, decideModeration, retractFact, confirmRevision, forgetFact,
+    getHead, listActive, activeApprovedRevisions, getVector, countActiveRefs,
+    audit, recordConsent, close,
+  };
+}

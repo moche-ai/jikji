@@ -1,0 +1,15 @@
+{
+  "name": "jikji-mcp",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Jikji — 한국어 개인 메모리 계층(CaaS MCP). MemoryCore(코어) + MCP 진입(server.mjs)",
+  "engines": { "node": ">=22.5.0" },
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0"
+  }
+}
