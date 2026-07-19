@@ -1,0 +1,11 @@
+# ★ 내부 전략·인프라 문서 — 퍼블릭 커밋 절대 금지
+docs/internal/
+HANDOFF.md
+*.env
+.env*
+node_modules/
+dist/
+__pycache__/
+*.sqlite
+*.db
+.venv/
