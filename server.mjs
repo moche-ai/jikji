@@ -25,6 +25,10 @@ const LOOPBACK = new Set(['127.0.0.1', '::1', 'localhost', '[::1]']);
 // 소켓 원격주소가 loopback 인가(Host 헤더 위조·DNS rebinding 방어 — dashboard.mjs 와 동일 강도).
 const isLoopbackAddr = (a) => !!a && (a === '127.0.0.1' || a === '::1' || a === '::ffff:127.0.0.1' || a.startsWith('127.'));
 const hostOf = (h) => String(h || '').replace(/:\d+$/, '').replace(/^\[|\]$/g, '');
+// 공개 노출 호스트 allowlist(리버스 프록시/터널 뒤). 소켓은 여전히 loopback(로컬 프록시)이어야 하고,
+// Host 헤더만 이 목록을 추가로 허용한다(예: JIKJI_PUBLIC_HOSTS=mcp.moche.ai). 미설정이면 loopback 전용.
+const PUBLIC_HOSTS = new Set((process.env.JIKJI_PUBLIC_HOSTS || '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean));
+const hostAllowed = (h) => LOOPBACK.has(h) || PUBLIC_HOSTS.has(String(h).toLowerCase());
 
 function buildServer(core, ctx) {
   const server = new McpServer({ name: NAME, version: VERSION }, { instructions: INSTRUCTIONS });
@@ -112,7 +116,7 @@ export function createJikjiServer({ dbPath, allowedOrigins = [], prod = (process
       // Host 검증(loopback 전용, DNS rebinding 방어 — P1-5). healthz 포함 전 경로에 우선 적용:
       // JIKJI_ALLOW_NONLOOPBACK 로 외부 bind 해도 원격 Host 는 healthz 조차 노출되지 않는다.
       // 기본(loopback 전용)엔 소켓주소+Host 둘 다 검증. JIKJI_ALLOW_NONLOOPBACK=1(프록시 뒤 의도적 노출)이면 소켓검증 생략.
-      if ((process.env.JIKJI_ALLOW_NONLOOPBACK !== '1' && !isLoopbackAddr(req.socket?.remoteAddress)) || !LOOPBACK.has(hostOf(req.headers.host))) { res.writeHead(403, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ error: 'host_forbidden' })); }
+      if ((process.env.JIKJI_ALLOW_NONLOOPBACK !== '1' && !isLoopbackAddr(req.socket?.remoteAddress)) || !hostAllowed(hostOf(req.headers.host))) { res.writeHead(403, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ error: 'host_forbidden' })); }
       if (req.method === 'GET' && url.pathname === '/healthz') {
         res.writeHead(200, { 'content-type': 'application/json' });
         return res.end(JSON.stringify({ ok: true, service: NAME, version: VERSION }));
