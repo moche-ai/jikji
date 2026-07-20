@@ -11,6 +11,7 @@ import { makeEmbedder } from './embed.mjs';
 import { makeReranker } from './rerank.mjs';
 import { MemoryCore } from './core.mjs';
 import { actorPseudonym } from './telemetry.mjs';
+import { makeResolveBearer } from './authz.mjs';
 
 const NAME = 'jikji-dashboard';
 const VERSION = '0.0.1';
@@ -35,6 +36,7 @@ export function createDashboard({ dbPath, prod = (process.env.JIKJI_ENV === 'pro
 
   const store = openStore(dbPath);
   const core = new MemoryCore(store, makeEmbedder(), { reranker: makeReranker() });
+  const resolveBearer = makeResolveBearer({ store, hashToken, authzDbPath: process.env.JIKJI_AUTHZ_DB || './data/jikji-authz.db' });
 
   const json = (res, code, obj) => { res.writeHead(code, { 'content-type': 'application/json', ...SEC_HEADERS }); res.end(JSON.stringify(obj)); };
 
@@ -50,7 +52,7 @@ export function createDashboard({ dbPath, prod = (process.env.JIKJI_ENV === 'pro
       // 인증(모든 /api) — Bearer jk_
       const auth = req.headers.authorization || '';
       const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
-      const resolved = token ? store.resolveKey(hashToken(token)) : null;
+      const resolved = resolveBearer(token);
       if (!resolved) return json(res, 401, { error: 'unauthorized' });
       const ctx = { namespaceId: resolved.namespaceId, scopes: resolved.scopes, authorType: 'self', actorPseudonym: actorPseudonym(resolved.keyId) };
 

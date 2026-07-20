@@ -17,6 +17,7 @@ import { makeEmbedder } from './embed.mjs';
 import { makeReranker } from './rerank.mjs';
 import { MemoryCore } from './core.mjs';
 import { actorPseudonym, emit, labelHash } from './telemetry.mjs';
+import { makeResolveBearer } from './authz.mjs';
 
 const LOOPBACK = new Set(['127.0.0.1', '::1', 'localhost', '[::1]']);
 const hostOf = (h) => String(h || '').replace(/:\d+$/, '').replace(/^\[|\]$/g, '');
@@ -53,6 +54,7 @@ export function createGateway({ dbPath, apiSecret, upstream = process.env.JIKJI_
 
   const store = openStore(dbPath);
   const core = new MemoryCore(store, makeEmbedder(), { reranker: makeReranker() });
+  const resolveBearer = makeResolveBearer({ store, hashToken, authzDbPath: process.env.JIKJI_AUTHZ_DB || './data/jikji-authz.db' });
   const json = (res, code, obj) => { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(obj)); };
 
   const httpServer = http.createServer(async (req, res) => {
@@ -64,7 +66,7 @@ export function createGateway({ dbPath, apiSecret, upstream = process.env.JIKJI_
       // 인증 = fail-CLOSED(검색 실패와 달리 절대 통과 금지).
       const auth = req.headers.authorization || '';
       const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
-      const resolved = token ? store.resolveKey(hashToken(token)) : null;
+      const resolved = resolveBearer(token);
       if (!resolved) return json(res, 401, { error: 'unauthorized' });
       const ctx = { namespaceId: resolved.namespaceId, scopes: resolved.scopes, authorType: 'self', actorPseudonym: actorPseudonym(resolved.keyId) };
 

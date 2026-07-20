@@ -15,6 +15,7 @@ import { makeReranker } from './rerank.mjs';
 import { startEmbeddingWorker } from './worker.mjs';
 import { MemoryCore } from './core.mjs';
 import { actorPseudonym } from './telemetry.mjs';
+import { makeResolveBearer, probeAuthzProjection } from './authz.mjs';
 import { INSTRUCTIONS, TOOL_DESC } from './protocol.mjs';
 
 const NAME = 'jikji';
@@ -76,12 +77,17 @@ export function createJikjiServer({ dbPath, allowedOrigins = [], prod = (process
   const secret = apiSecret ?? process.env.JIKJI_API_HMAC_SECRET ?? (prod ? null : 'dev-jikji-api-secret');
   if (!secret) throw new Error('JIKJI_API_HMAC_SECRET missing (fail-closed in production)'); // P0-8: 시작 시 검증
   const hashToken = (t) => crypto.createHmac('sha256', secret).update(String(t)).digest('hex');
+  // 통합 ID(unified account): Bearer 'jku_…' → 공유 authz projection 리졸브. 'jk_…' → 자체 store(HMAC).
+  const authzDbPath = process.env.JIKJI_AUTHZ_DB || './data/jikji-authz.db';
 
   const store = openStore(dbPath);
   const embedder = makeEmbedder();
   const core = new MemoryCore(store, embedder, { reranker: makeReranker() });
   // 실 임베더(async)면 백그라운드 임베딩 워커 기동(요청경로 무차단, GPU admission 게이트 뒤). 스캐폴드는 인라인.
   const stopWorker = embedder.isAsync ? startEmbeddingWorker(store, embedder) : null;
+  const resolveBearer = makeResolveBearer({ store, hashToken, authzDbPath });
+  // 부팅 probe(비치명): projection 없으면 통합키 인증만 fail-closed, 자체 store 는 정상.
+  if (!probeAuthzProjection(authzDbPath)) console.error(`[jikji] authz projection unavailable at ${authzDbPath} — unified (jku_) keys will fail-closed; native keys OK`);
   const allowed = new Set(allowedOrigins);
 
   const httpServer = http.createServer(async (req, res) => {
@@ -102,7 +108,7 @@ export function createJikjiServer({ dbPath, allowedOrigins = [], prod = (process
 
       const auth = req.headers.authorization || '';
       const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
-      const resolved = token ? store.resolveKey(hashToken(token)) : null;
+      const resolved = resolveBearer(token);
       if (!resolved) { res.writeHead(401, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ error: 'unauthorized' })); }
       // namespace·authorType 봉인(owner MCP = self). 클라이언트가 못 바꿈.
       const ctx = { namespaceId: resolved.namespaceId, scopes: resolved.scopes, authorType: 'self', actorPseudonym: actorPseudonym(resolved.keyId) };
