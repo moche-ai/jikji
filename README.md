@@ -22,6 +22,18 @@ tool can share through the [Model Context Protocol](https://modelcontextprotocol
 - **Korean-first** — retrieval quality is measured on a Korean long-term-memory benchmark; English is
   first-class, CJK is the edge.
 
+## Why Jikji
+
+Short version — every point is verifiable in this repo (see [`docs/public/WHY-JIKJI.md`](docs/public/WHY-JIKJI.md) for the detailed breakdown):
+
+- **Runs everywhere** — MCP clients (Claude Code, Cursor), any OpenAI-compatible framework (Gateway `base_url` swap), custom agents. No external vector/graph DB — one Node process, one SQLite file.
+- **Trust by default** — no-train by default, review-before-index, secrets refused at write time, prompt-injection quarantined, structural tenant isolation (IDOR-denied), and deletion that cascades with a zero-reference purge — all with tests as evidence.
+- **Fast, self-hosted** — hybrid BM25 + dense + RRF + a reranker on *every* query; measured `memory_search` ≈ **223 ms** end-to-end on local GPU (no per-call external API tax).
+- **Quality, measured** — no-regression gate on a Korean long-term-memory benchmark; time/contradiction handled (supersede + disputed), not guessed at write time.
+- **Saves tokens** — recall a confirmed fact instead of re-explaining it, and inject only the *relevant* memories, not the whole history.
+- **Multimodal** — cross-modal text ↔ image recall in one unified vector space (a capability general memory services don't offer).
+- **Yours** — a single portable SQLite file, Markdown export/import, full lineage, Apache-2.0. No lock-in.
+
 ## Architecture — core ≠ entry point
 
 The memory core is one embeddable module; MCP / gateway / adapters are thin entry points over it.
