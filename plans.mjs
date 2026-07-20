@@ -7,8 +7,8 @@ export const PLANS = Object.freeze({
   free:  { label: 'Free',  price_krw: 0,     price_usd: 0,     max_memories: 2000,   max_calls_per_month: 2000 },
   basic: { label: 'Basic', price_krw: 4900,  price_usd: 4.99,  max_memories: 20000,  max_calls_per_month: 50000 },
   pro:   { label: 'Pro',   price_krw: 19900, price_usd: 14.99, max_memories: 200000, max_calls_per_month: 500000 },
-  // 베타 테스터: Pro 급 캡, 무료(베타 기간). 운영자가 부여.
-  beta:  { label: 'Beta',  price_krw: 0,     price_usd: 0,     max_memories: 200000, max_calls_per_month: 500000 },
+  // 베타 테스터: 무료 + 실질 무제한(1개월 클로즈드 베타). 품질은 동일(단일 등급), 캡만 해제.
+  beta:  { label: 'Beta',  price_krw: 0,     price_usd: 0,     max_memories: 100000000, max_calls_per_month: 100000000 },
 });
 
 export const DEFAULT_PLAN = 'free';

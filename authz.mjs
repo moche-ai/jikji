@@ -92,7 +92,7 @@ export function readAuthzProjection(dbPath, token) {
  * 공통 Bearer 리졸버 팩토리 — 세 진입점 공통. projection 연결·prepared statement 재사용(요청마다 open 금지).
  * @returns {(token:string|null)=>({namespaceId:string,scopes:string[],keyId:string}|null)}
  */
-export function makeResolveBearer({ store, hashToken, authzDbPath, ensurePolicy = { auto_approve: true, default_no_train: true } }) {
+export function makeResolveBearer({ store, hashToken, authzDbPath, ensurePolicy = { auto_approve: true, default_no_train: true, plan: 'beta' } }) {
   const ensured = new Set();          // subject 최초 provisioning 만 write(요청마다 write 금지)
   let db = null;
   let stmt = null;
