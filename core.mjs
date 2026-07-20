@@ -60,7 +60,7 @@ export class MemoryCore {
 
   _embedFn() {
     const emb = this.embedder;
-    return (text) => { const [v] = emb.embed([text]); return { dim: emb.dim, buf: packVector(v), embedderId: emb.id, embedderVer: emb.ver }; };
+    return (text) => { const [v] = emb.embed([text]); return { dim: v.length, buf: packVector(v), embedderId: emb.id, embedderVer: emb.ver }; };
   }
 
 

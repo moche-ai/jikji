@@ -18,7 +18,7 @@ export async function drainOnce(store, embedder, { gpuGate = true, admitOpts = {
   }
   const embedFn = async (text) => {
     const [v] = await embedder.embed([text]);
-    return { dim: embedder.dim, buf: packVector(v), embedderId: embedder.id, embedderVer: embedder.ver };
+    return { dim: v.length, buf: packVector(v), embedderId: embedder.id, embedderVer: embedder.ver };   // 실제 벡터 길이(모델별 dim 무관)
   };
   let total = 0;
   for (const ns of store.namespacesWithPendingEmbeddings()) {
