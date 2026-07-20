@@ -76,7 +76,12 @@ export function bm25Scores(queryText, docs) {
 // 기본 = confirm 부스트 + stale 감쇠(평가 중립: 동시각·미confirm 사실엔 배수 균일 → 회귀 없음).
 // 연속 recency 항은 기본 OFF(wRecency 0) — 동시각 사실 사이 미세 tie-breaking 이 하드셋을 회귀시켜(0.71→0.64),
 // confirm 행동으로 학습되는 per-user opt-in 으로만 켠다(tuneOnConfirm). 순수 시간-순 재정렬은 노이즈가 큼.
-export function temporalWeight(meta, nowMs, { wRecency = 0, wConfirm = 0.3, wStale = 0.2, halflifeDays = 180 } = {}) {
+export function temporalWeight(meta, nowMs, opts = {}) {
+  const num = (v, d) => (typeof v === 'number' && Number.isFinite(v) ? v : d);
+  const wRecency = Math.max(0, Math.min(1, num(opts.wRecency, 0)));
+  const wConfirm = Math.max(0, Math.min(1, num(opts.wConfirm, 0.3)));
+  const wStale = Math.max(0, Math.min(1, num(opts.wStale, 0.2)));
+  const halflifeDays = Math.max(1, num(opts.halflifeDays, 180));
   const ageDays = Math.max(0, (nowMs - (meta.recorded_at || nowMs)) / 86400000);
   const recency = wRecency ? Math.exp(-ageDays / halflifeDays) : 0;   // 1(방금)~0(오래됨), 기본 미사용
   const confirmed = meta.confirms > 0 ? 1 : 0;

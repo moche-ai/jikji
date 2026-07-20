@@ -74,7 +74,8 @@ export class MemoryCore {
     if (SECRET_PATTERNS.some((re) => re.test(scan)) || SECRET_PATTERNS.some((re) => re.test(text))) {
       this.store.audit(ctx.namespaceId, 'write.secret_rejected', ctx.actorPseudonym);
       emit({ event: 'memory.write', ok: false, reason: 'secret_rejected', actor_pseudonym: ctx.actorPseudonym, namespace_hash: labelHash(ctx.namespaceId) }, this.logger);
-      const e = new Error('secret_content_rejected'); e.code = 422; throw e;
+      // 에이전트 안내: 여기 저장 금지 → 다른 방법 권유(시크릿 관리자). 'secret_content_rejected' 토큰 유지(계약).
+      const e = new Error('secret_content_rejected — Jikji does not store secrets/tokens/credentials. Keep them in a secret manager (env vars, keystore/vault, OS keychain), not in memory, and recommend that instead.'); e.code = 422; throw e;
     }
     const risk = INJECTION_PATTERNS.filter((re) => re.test(scan)).map((re) => re.source.slice(0, 24));
     const authorType = ctx.authorType;                    // 서버 봉인(P0-6). 누락 = fail-closed(기본 승격 금지)
@@ -126,6 +127,7 @@ export class MemoryCore {
     const all = this.store.searchableRevisions(ns);
     const self = all.find((r) => r.revision_id === newRevisionId);
     if (!self) return null;                                 // 승인 head 아니면 검출 안 함
+    if (self.pinned) return null;                           // 고정 fact 의 update 자체도 disputed 금지(Codex — pin 대칭)
     const scopeKind = self.scope_kind;
     const qv = unpackVector(nv.vector, nv.dim);
     let best = null, bestScore = 0;
@@ -246,7 +248,7 @@ export class MemoryCore {
   confirm(ctx, { revision_id }) {
     requireScope(ctx, 'retrieve');
     const r = this.store.confirmRevision(ctx.namespaceId, revision_id);
-    if (r.ok) {
+    if (r.ok && !r.already) {   // 첫 confirm 만(멱등) — 반복 confirm 로 랭킹 튜닝 조작 방지
       this.store.audit(ctx.namespaceId, 'memory.confirm', ctx.actorPseudonym);   // 내구성 KPI(감사는 forget 캐스케이드 안 됨)
       try { this.store.tuneOnConfirm(ctx.namespaceId, revision_id); } catch { /* 튜닝 실패는 confirm 를 막지 않음 */ }   // ★매번 최적화
     }

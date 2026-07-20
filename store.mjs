@@ -125,6 +125,7 @@ CREATE TABLE IF NOT EXISTS fact_events (
   PRIMARY KEY (namespace_id, seq),
   FOREIGN KEY (namespace_id, fact_id) REFERENCES facts(namespace_id, fact_id) ON DELETE CASCADE
 );
+CREATE INDEX IF NOT EXISTS idx_events_rev_type ON fact_events(namespace_id, revision_id, type);
 
 CREATE TABLE IF NOT EXISTS fact_commands (
   namespace_id    TEXT NOT NULL,
@@ -476,10 +477,18 @@ export function openStore(dbPath) {
 
   function confirmRevision(ns, revisionId) {
     return tx(() => {
-      const rev = db.prepare('SELECT fact_id FROM fact_revisions WHERE namespace_id=? AND revision_id=?').get(ns, revisionId);
+      // active 승인 head 만 confirm 가능(superseded/retracted/quarantined·비head confirm 차단 — 랭킹 오염 방지, Codex).
+      const rev = db.prepare(`SELECT r.fact_id FROM facts f
+                                JOIN fact_revisions r ON r.namespace_id=f.namespace_id AND r.revision_id=f.head_revision_id
+                                JOIN moderation m ON m.namespace_id=r.namespace_id AND m.revision_id=r.revision_id
+                               WHERE f.namespace_id=? AND r.revision_id=? AND r.status=? AND m.state=?`)
+        .get(ns, revisionId, STATUS.ACTIVE, MOD.APPROVED);
       if (!rev) return { ok: false };
+      // 멱등: revision 당 confirm 이벤트 1회만(retrieve 권한 반복 confirm 로 튜닝 조작 방지).
+      const already = db.prepare("SELECT 1 FROM fact_events WHERE namespace_id=? AND revision_id=? AND type='confirm'").get(ns, revisionId);
+      if (already) return { ok: true, already: true };
       db.prepare('INSERT INTO fact_events(namespace_id,seq,fact_id,revision_id,type,at) VALUES(?,?,?,?,?,?)').run(ns, seqIn('fact_events', ns), rev.fact_id, revisionId, 'confirm', Date.now());
-      return { ok: true };
+      return { ok: true, already: false };
     });
   }
 
@@ -709,19 +718,23 @@ export function openStore(dbPath) {
     let blob = {}; try { blob = JSON.parse(r.scope_weights || '{}'); } catch { /* noop */ }
     return { k: r.k, rerank_threshold: r.rerank_threshold, temporal: blob.temporal || {} };
   }
-  /** confirm 된 사실의 나이로 recency 가중을 넛지(EMA, bounded): 옛 사실을 확인=안정 선호→recency↓, 최신 확인→↑. */
+  /** confirm 된 사실의 나이로 recency 가중을 넛지(EMA, bounded). tx 안에서 read→UPSERT(동시 confirm lost update 방지, Codex).
+   *  scope_weights blob 의 기존 키는 보존(temporal 만 갱신). */
   function tuneOnConfirm(ns, revisionId) {
-    const rev = db.prepare('SELECT recorded_at FROM fact_revisions WHERE namespace_id=? AND revision_id=?').get(ns, revisionId);
-    if (!rev) return;
-    const ageDays = Math.max(0, (Date.now() - rev.recorded_at) / 86400000);
-    const cur = getSearchParams(ns);
-    const wR0 = typeof cur.temporal?.wRecency === 'number' ? cur.temporal.wRecency : 0.25;
-    const target = ageDays > 180 ? 0.1 : 0.35;
-    const wR = Math.max(0.05, Math.min(0.5, +(wR0 + 0.1 * (target - wR0)).toFixed(4)));   // EMA nudge, clamp
-    const blob = { temporal: { ...cur.temporal, wRecency: wR } };
-    db.prepare(`INSERT INTO search_params(namespace_id,k,rerank_threshold,scope_weights) VALUES(?,?,?,?)
-                ON CONFLICT(namespace_id) DO UPDATE SET scope_weights=excluded.scope_weights`)
-      .run(ns, cur.k || 8, cur.rerank_threshold || 0.5, JSON.stringify(blob));
+    tx(() => {
+      const rev = db.prepare('SELECT recorded_at FROM fact_revisions WHERE namespace_id=? AND revision_id=?').get(ns, revisionId);
+      if (!rev) return;
+      const row = db.prepare('SELECT k, rerank_threshold, scope_weights FROM search_params WHERE namespace_id=?').get(ns);
+      let blob = {}; try { blob = JSON.parse(row?.scope_weights || '{}'); } catch { /* noop */ }
+      const ageDays = Math.max(0, (Date.now() - rev.recorded_at) / 86400000);
+      const wR0 = typeof blob.temporal?.wRecency === 'number' ? blob.temporal.wRecency : 0;
+      const target = ageDays > 180 ? 0.05 : 0.35;
+      const wR = Math.max(0.05, Math.min(0.5, +(wR0 + 0.1 * (target - wR0)).toFixed(4)));   // EMA nudge, clamp
+      blob.temporal = { ...blob.temporal, wRecency: wR };                                    // 기존 키 보존
+      db.prepare(`INSERT INTO search_params(namespace_id,k,rerank_threshold,scope_weights) VALUES(?,?,?,?)
+                  ON CONFLICT(namespace_id) DO UPDATE SET scope_weights=excluded.scope_weights`)
+        .run(ns, row?.k || 8, row?.rerank_threshold || 0.5, JSON.stringify(blob));
+    });
   }
 
   /** pin: 중요 기억 고정 — 자동 supersede/모순 disputed 후보에서 제외 + 목록 상단(향후 decay 면제). */
@@ -740,15 +753,16 @@ export function openStore(dbPath) {
         WHERE f.namespace_id=? AND r.status=? AND f.pinned=0 AND r.recorded_at < ?
           AND NOT EXISTS (SELECT 1 FROM fact_events e WHERE e.namespace_id=r.namespace_id AND e.revision_id=r.revision_id AND e.type='confirm')
         ORDER BY r.recorded_at ASC LIMIT ?`).all(ns, STATUS.ACTIVE, cutoff, limit);
-    // 중복: 같은 content_hash 활성 head 2+ (dedup 우회분·구DB) → 병합/삭제 후보.
-    const duplicates = db.prepare(`SELECT r.content_hash AS hash, COUNT(*) AS count, GROUP_CONCAT(r.fact_id) AS fact_ids
+    // 중복: 같은 content_hash 활성 head 2+ (dedup 우회분·구DB) → 병합/삭제 후보. **원문 해시는 응답에 미노출**(사전대입 표면 제거, Codex).
+    const duplicates = db.prepare(`SELECT COUNT(*) AS count, GROUP_CONCAT(r.fact_id) AS fact_ids
         FROM facts f JOIN fact_revisions r ON r.namespace_id=f.namespace_id AND r.revision_id=f.head_revision_id
         WHERE f.namespace_id=? AND r.status=? GROUP BY r.content_hash HAVING count > 1 LIMIT ?`).all(ns, STATUS.ACTIVE, limit)
-      .map((d) => ({ ...d, fact_ids: (d.fact_ids || '').split(',') }));
-    // 충돌: disputed 묶음 → 유저가 하나 선택/정정.
+      .map((d) => ({ count: d.count, fact_ids: (d.fact_ids || '').split(',') }));
+    // 충돌: **여전히 disputed 인** 묶음만(해소된 묶음 제외, Codex) → 유저가 하나 선택/정정.
     const conflicts = db.prepare(`SELECT cs.set_id, GROUP_CONCAT(cm.revision_id) AS revision_ids
         FROM conflict_sets cs JOIN conflict_members cm ON cm.namespace_id=cs.namespace_id AND cm.set_id=cs.set_id
-        WHERE cs.namespace_id=? GROUP BY cs.set_id LIMIT ?`).all(ns, limit)
+        JOIN fact_revisions r ON r.namespace_id=cm.namespace_id AND r.revision_id=cm.revision_id AND r.status=?
+        WHERE cs.namespace_id=? GROUP BY cs.set_id HAVING COUNT(*) >= 2 LIMIT ?`).all(STATUS.DISPUTED, ns, limit)
       .map((c) => ({ ...c, revision_ids: (c.revision_ids || '').split(',') }));
     return { stale, duplicates, conflicts, counts: { stale: stale.length, duplicates: duplicates.length, conflicts: conflicts.length } };
   }
