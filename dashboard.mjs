@@ -79,6 +79,8 @@ export function createDashboard({ dbPath, prod = (process.env.JIKJI_ENV === 'pro
       case 'GET /api/graph': return core.graph(ctx, { need: url.searchParams.get('need') || null, limit: Number(url.searchParams.get('limit') || 120) });
       case 'GET /api/memories': return core.list(ctx, { limit: Number(url.searchParams.get('limit') || 50) });
       case 'GET /api/pending': return core.pending(ctx);
+      case 'GET /api/usage': return core.usage(ctx);
+      case 'POST /api/feedback': return core.feedback(ctx, body);
       case 'GET /api/hygiene': return core.hygiene(ctx, {});
       case 'GET /api/lineage': return core.lineage(ctx, { fact_id: url.searchParams.get('fact_id') });
       case 'POST /api/pin': return core.pin(ctx, body);

@@ -61,6 +61,10 @@ export const TOOL_DESC = {
     'Export active memories as a human-readable Markdown digest (portability/trust). | 활성 기억을 md 다이제스트로 export.',
   memory_graph:
     'Explore the memory map — related memories linked by shared terms (optionally focused on a need). | 기억 지도 — 공유 용어로 이어진 관련 기억 탐색.',
+  memory_usage:
+    'Your plan, current-month usage, memory count, and remaining caps. | 요금제·이번 달 사용량·기억 수·잔여 캡.',
+  memory_feedback:
+    'Send a bug report or feature request to the operators. | 버그·기능요청을 운영자에게 전송.',
   memory_hygiene:
     'Surface memories needing cleanup — stale (old, never confirmed), duplicates, and conflicts — to CRUD. | 정리 필요 기억(오래됨·중복·충돌) 표면화.',
   memory_lineage:

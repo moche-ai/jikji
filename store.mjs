@@ -211,6 +211,29 @@ CREATE TABLE IF NOT EXISTS audit_log (
   PRIMARY KEY (namespace_id, seq)
 );
 
+-- 사용량 집계(월별 콜 캡·유저별 현황). 결정성 위해 period=YYYY-MM(UTC).
+CREATE TABLE IF NOT EXISTS usage (
+  namespace_id TEXT NOT NULL,
+  period       TEXT NOT NULL,
+  calls        INTEGER NOT NULL DEFAULT 0,
+  searches     INTEGER NOT NULL DEFAULT 0,
+  writes       INTEGER NOT NULL DEFAULT 0,
+  updated_at   INTEGER NOT NULL,
+  PRIMARY KEY (namespace_id, period)
+);
+
+-- 베타 피드백/버그 리포트(유저→운영자). 운영자는 전 namespace 조회, 유저는 자기 것만.
+CREATE TABLE IF NOT EXISTS feedback (
+  namespace_id TEXT NOT NULL,
+  id           TEXT NOT NULL,
+  type         TEXT NOT NULL,
+  text         TEXT NOT NULL,
+  status       TEXT NOT NULL DEFAULT 'open',
+  created_at   INTEGER NOT NULL,
+  meta         TEXT,
+  PRIMARY KEY (namespace_id, id)
+);
+
 -- 베타 invite 코드(발급=운영자, 리딤=키 발급). 발송은 유저 게이트 — 여기선 코드 생성/리딤만.
 CREATE TABLE IF NOT EXISTS invites (
   code         TEXT PRIMARY KEY,
@@ -767,10 +790,50 @@ export function openStore(dbPath) {
     return { stale, duplicates, conflicts, counts: { stale: stale.length, duplicates: duplicates.length, conflicts: conflicts.length } };
   }
 
+  // ── 사용량(월 콜 캡·유저 현황) / 피드백 ──
+  function incUsage(ns, period, kind) {   // kind = 'search' | 'write'
+    const now = Date.now(); const s = kind === 'search' ? 1 : 0; const w = kind === 'write' ? 1 : 0;
+    db.prepare(`INSERT INTO usage(namespace_id,period,calls,searches,writes,updated_at) VALUES(?,?,1,?,?,?)
+                ON CONFLICT(namespace_id,period) DO UPDATE SET calls=calls+1, searches=searches+?, writes=writes+?, updated_at=?`)
+      .run(ns, period, s, w, now, s, w, now);
+  }
+  function getUsage(ns, period) {
+    return db.prepare('SELECT calls, searches, writes FROM usage WHERE namespace_id=? AND period=?').get(ns, period) || { calls: 0, searches: 0, writes: 0 };
+  }
+  function countMemories(ns) {
+    return db.prepare(`SELECT COUNT(*) c FROM facts f JOIN fact_revisions r ON r.namespace_id=f.namespace_id AND r.revision_id=f.head_revision_id
+                       WHERE f.namespace_id=? AND r.status=?`).get(ns, STATUS.ACTIVE).c;
+  }
+  /** namespace policy 병합 갱신(plan·캡 override 등 운영자 조정). */
+  function updatePolicy(ns, patch) {
+    const cur = getNamespace(ns);
+    if (!cur) return null;
+    const merged = { ...(cur.policy || {}), ...patch };
+    db.prepare('UPDATE namespaces SET policy_json=? WHERE namespace_id=?').run(JSON.stringify(merged), ns);
+    return merged;
+  }
+  function updateFeedbackStatus(ns, id, status) {
+    const r = db.prepare('UPDATE feedback SET status=? WHERE namespace_id=? AND id=?').run(status, ns, id);
+    return r.changes === 1;
+  }
+  function addFeedback(ns, { type, text, meta = null }) {
+    const id = newId('fb');
+    db.prepare('INSERT INTO feedback(namespace_id,id,type,text,status,created_at,meta) VALUES(?,?,?,?,?,?,?)')
+      .run(ns, id, type, text, 'open', Date.now(), meta ? JSON.stringify(meta) : null);
+    return { id };
+  }
+  /** ns 주면 그 유저 것만, null 이면 전 namespace(운영자). */
+  function listFeedback(ns = null, { limit = 100 } = {}) {
+    if (ns) return db.prepare('SELECT id, type, text, status, created_at FROM feedback WHERE namespace_id=? ORDER BY created_at DESC LIMIT ?').all(ns, limit);
+    return db.prepare('SELECT namespace_id, id, type, text, status, created_at FROM feedback ORDER BY created_at DESC LIMIT ?').all(limit);
+  }
+
   function close() { db.close(); }
 
   return {
-    SCHEMA_VERSION, contentHash, kpis, lineage, setPinned, getSearchParams, tuneOnConfirm, hygiene, createInvite, redeemInvite, redeemInviteWithKey, listInvites,
+    SCHEMA_VERSION, contentHash, kpis, lineage, setPinned, getSearchParams, tuneOnConfirm, hygiene,
+    incUsage, getUsage, countMemories, addFeedback, listFeedback, updatePolicy, updateFeedbackStatus,
+    createInvite, redeemInvite, redeemInviteWithKey, listInvites,
     ensureNamespace, getNamespace, insertApiKey, resolveKey, revokeApiKey, listApiKeys,
     writeFact, processEmbeddings, processEmbeddingsAsync, namespacesWithPendingEmbeddings,
     decideModeration, retractFact, confirmRevision, forgetFact,

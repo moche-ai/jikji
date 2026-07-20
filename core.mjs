@@ -12,6 +12,7 @@ import { MOD, STATUS } from './store.mjs';
 import { packVector, unpackVector, cosine } from './embed.mjs';
 import { emit, notionalCost, labelHash } from './telemetry.mjs';
 import { bm25Scores, rrfFuse, classifyHard, buildGraph, temporalWeight, pickInstruction } from './search.mjs';
+import { planFor, periodKey, DEFAULT_PLAN } from './plans.mjs';
 
 // injection 패턴(risk signal — 승인 근거 아님)
 const INJECTION_PATTERNS = [
@@ -49,6 +50,55 @@ export class MemoryCore {
     return this.store.ensureNamespace(namespaceId, ownerScope, policy);
   }
 
+  _plan(ns) {
+    const policy = this.store.getNamespace(ns)?.policy || {};
+    const base = planFor(policy.plan || DEFAULT_PLAN);
+    // namespace policy 로 캡 override 허용(운영 유연성 — 특정 유저 상향/하향).
+    return {
+      ...base,
+      max_memories: Number.isFinite(policy.max_memories) ? policy.max_memories : base.max_memories,
+      max_calls_per_month: Number.isFinite(policy.max_calls_per_month) ? policy.max_calls_per_month : base.max_calls_per_month,
+    };
+  }
+  /** 월 콜 캡 강제 + 계측(양 차등만 — 품질은 단일 등급). 초과 = 429. */
+  _meter(ctx, kind) {
+    const period = periodKey(Date.now());
+    const plan = this._plan(ctx.namespaceId);
+    const u = this.store.getUsage(ctx.namespaceId, period);
+    if (u.calls >= plan.max_calls_per_month) {
+      emit({ event: 'rate-limit', ok: false, reason: 'monthly_call_quota', tier: plan.label, actor_pseudonym: ctx.actorPseudonym, namespace_hash: labelHash(ctx.namespaceId) }, this.logger);
+      const e = new Error('monthly_call_quota_exceeded'); e.code = 429; throw e;
+    }
+    this.store.incUsage(ctx.namespaceId, period, kind);
+  }
+
+  /** 유저별 현황: 요금제·이번 달 사용량·기억 수·잔여 캡. 대시보드/유저 조회. */
+  usage(ctx) {
+    requireScope(ctx, 'retrieve');
+    const plan = this._plan(ctx.namespaceId);
+    const period = periodKey(Date.now());
+    const u = this.store.getUsage(ctx.namespaceId, period);
+    const memories = this.store.countMemories(ctx.namespaceId);
+    return {
+      plan: plan.label, period, price_krw: plan.price_krw, price_usd: plan.price_usd,
+      calls: u.calls, searches: u.searches, writes: u.writes,
+      memories, caps: { max_memories: plan.max_memories, max_calls_per_month: plan.max_calls_per_month },
+      remaining: { memories: Math.max(0, plan.max_memories - memories), calls: Math.max(0, plan.max_calls_per_month - u.calls) },
+    };
+  }
+
+  /** 베타 피드백/버그 리포트 — 유저→운영자. 계측(운영이 바로 인지). */
+  feedback(ctx, { type = 'feature', text }) {
+    requireScope(ctx, 'retrieve');
+    if (!['bug', 'feature', 'other'].includes(type)) { const e = new Error('bad_type'); e.code = 422; throw e; }
+    if (typeof text !== 'string' || !text.trim()) { const e = new Error('empty_text'); e.code = 422; throw e; }
+    if (text.length > 4000) { const e = new Error('text_too_large'); e.code = 413; throw e; }
+    const r = this.store.addFeedback(ctx.namespaceId, { type, text: text.slice(0, 4000) });
+    this.store.audit(ctx.namespaceId, 'memory.feedback', ctx.actorPseudonym, { type });
+    emit({ event: 'feedback', ok: true, reason: type, actor_pseudonym: ctx.actorPseudonym, namespace_hash: labelHash(ctx.namespaceId) }, this.logger);
+    return r;
+  }
+
   // moderation: risk/external/third_party → quarantine · assistant(자동추출) → pending · self → 정책 auto_approve
   _moderate(ns, authorType, riskFlags) {
     if (riskFlags?.length) return MOD.QUARANTINED;
@@ -67,6 +117,7 @@ export class MemoryCore {
   // ── WRITE (authorType = ctx 봉인, payload 불신) ──
   write(ctx, { text, kind = 'semantic', scopeKind = 'user', scopeRef = null, idempotencyKey = null, factId = null, expectedVersion = null }) {
     requireScope(ctx, 'write');
+    this._meter(ctx, 'write');                     // 월 콜 캡 강제 + 계측(양 차등)
     const t0 = Date.now();
     if (typeof text !== 'string' || !text.trim()) { const e = new Error('empty_text'); e.code = 422; throw e; }
     if (text.length > 8000) { const e = new Error('text_too_large'); e.code = 413; throw e; }
@@ -92,6 +143,10 @@ export class MemoryCore {
       }
     }
 
+    if (!factId) {   // 신규 fact 생성 = 기억 수 캡(양 차등만). 초과 = 402.
+      const plan = this._plan(ctx.namespaceId);
+      if (this.store.countMemories(ctx.namespaceId) >= plan.max_memories) { const e = new Error('memory_quota_exceeded'); e.code = 402; throw e; }
+    }
     const res = this.store.writeFact(ctx.namespaceId, {
       factId, text, kind, scopeKind, scopeRef, authorType, moderationState, riskFlags: risk.length ? risk : null,
       expectedVersion, idempotencyKey,
@@ -152,6 +207,7 @@ export class MemoryCore {
   //  async: 실 임베더(KURE-v1)·리랭커(Qwen3)는 HTTP(await). 스캐폴드는 동기지만 인터페이스 통일.
   async search(ctx, { task_context = '', need = '', location = '', k = 8 } = {}) {
     requireScope(ctx, 'retrieve');
+    this._meter(ctx, 'search');                    // 월 콜 캡 강제 + 계측
     const t0 = Date.now();
     for (const [n, v] of [['task_context', task_context], ['need', need], ['location', location]]) {
       if (typeof v !== 'string') { const e = new Error(`bad_${n}`); e.code = 422; throw e; }
