@@ -44,9 +44,23 @@ small English-centric rerankers hurt Korean). **Qwen3-Reranker-4B** is the fallb
 (retains ~97% of Korean NDCG@10); `bge-reranker-v2-m3` (0.6B) is the strongest quality-preserving
 downgrade to A/B against a Korean golden set if ever needed.
 
-## Batching (implemented)
+## Measured (this GPU)
 
-`rerank_server.py` batches all candidate (query, doc) pairs into one forward pass instead of scoring
-them sequentially — the first and largest local win (measured ~4× on the naive server). Production
-serving (vLLM + seq-cls + FP8) is the path to sub-100 ms; the existing vLLM reranker already clears the
-SLO today.
+| reranker serving | 20-doc rerank | notes |
+|---|---|---|
+| naive transformers, **sequential** | ~1.78 s | one forward per (query,doc) |
+| naive transformers, **batched** | ~0.44 s | `rerank_server.py` — one batched forward |
+| naive transformers, batched **seq-cls** | ~0.43 s | only ~12% over causal here — see below |
+| **vLLM (reranker)** | **~0.137 s** | the real lever |
+
+**Empirical correction:** in a transformers server that already scores with a single forward + last-token
+logits, the seq-cls head only saves the final-token vocab projection (~12%), because prefill of the 20
+sequences dominates. The ~3× win attributed to seq-cls is really the **serving stack** (vLLM's continuous
+batching + CUDA graphs + optimized prefill): vLLM 137 ms vs a naive batched transformers server 440 ms.
+All three score identically and reach the same eval quality (hard = 1.0). seq-cls still matters in vLLM
+(it enables the `score` task and composes with FP8).
+
+**End-to-end (measured):** with Qwen3-Embedding-8B (embed) + the vLLM reranker (rerank-all), a full
+`memory_search` round-trip is **~223 ms** — comfortably inside the 500 ms SLO — while reusing the
+platform's existing vLLM reranker (zero extra GPU for the reranker). Dedicated vLLM + seq-cls + FP8 is
+the path to sub-100 ms if higher QPS is ever needed.
