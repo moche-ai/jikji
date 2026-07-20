@@ -130,7 +130,8 @@ export class MemoryCore {
     const qv = unpackVector(nv.vector, nv.dim);
     let best = null, bestScore = 0;
     for (const r of all) {
-      if (r.revision_id === newRevisionId || r.status !== STATUS.ACTIVE || r.scope_kind !== scopeKind) continue;
+      // pin 된 기억은 보호 — 새 충돌본이 disputed 로 끌어내리지 않는다.
+      if (r.revision_id === newRevisionId || r.status !== STATUS.ACTIVE || r.scope_kind !== scopeKind || r.pinned) continue;
       const v = this.store.getVector(ns, r.revision_id);
       if (!v) continue;
       const s = cosine(qv, unpackVector(v.vector, v.dim));
@@ -304,6 +305,33 @@ export class MemoryCore {
     this.store.audit(ctx.namespaceId, 'memory.import', ctx.actorPseudonym, { units: units.length, imported });
     emit({ event: 'memory.import', ok: true, result_count: imported, actor_pseudonym: ctx.actorPseudonym, namespace_hash: labelHash(ctx.namespaceId) }, this.logger);
     return { import_id, units: units.length, imported, results };
+  }
+
+  /** 고급: 기억 이력(lineage) — 리비전·이벤트·대체관계. 설명가능성/신뢰(Curator 파워유저 대응). */
+  lineage(ctx, { fact_id }) {
+    requireScope(ctx, 'retrieve');
+    const l = this.store.lineage(ctx.namespaceId, fact_id);
+    if (!l) { const e = new Error('fact_not_found'); e.code = 404; throw e; }
+    return l;
+  }
+  /** 고급: pin/unpin — 중요 기억 보호(자동 supersede/disputed 면제, 목록 상단). */
+  pin(ctx, { fact_id, pinned = true }) {
+    requireScope(ctx, 'write');
+    const r = this.store.setPinned(ctx.namespaceId, fact_id, pinned);
+    this.store.audit(ctx.namespaceId, 'memory.pin', ctx.actorPseudonym, { pinned: !!pinned });
+    emit({ event: 'memory.pin', ok: true, actor_pseudonym: ctx.actorPseudonym, namespace_hash: labelHash(ctx.namespaceId) }, this.logger);
+    return r;
+  }
+  /** 고급: 배치 저장 — 여러 사실을 한 번에(각각 write 게이트 통과). 부분 성공 허용. */
+  writeBatch(ctx, { items }) {
+    requireScope(ctx, 'write');
+    if (!Array.isArray(items) || !items.length) { const e = new Error('items_required'); e.code = 422; throw e; }
+    if (items.length > 200) { const e = new Error('too_many_items'); e.code = 413; throw e; }
+    const results = items.map((it) => {
+      try { return { ...this.write(ctx, { text: it.text, kind: it.kind, scopeKind: it.scope_kind, scopeRef: it.scope_ref, idempotencyKey: it.idempotency_key }) }; }
+      catch (e) { return { error: e.message, code: e.code || 500 }; }
+    });
+    return { count: results.filter((r) => r.fact_id).length, results };
   }
 
   /** M5 기억 지도(L2 근사) — 활성 fact 노드 + 공유 유의미 토큰 엣지. need 주면 관련 fact 를 상단 정렬. */

@@ -33,7 +33,7 @@ test('MCP SDK 호환: initialize + tools/list + write→search 라운드트립',
 
     const tools = await client.listTools();
     const names = tools.tools.map((t) => t.name).sort();
-    assert.deepEqual(names, ['memory_confirm', 'memory_export_md', 'memory_forget', 'memory_graph', 'memory_import_md', 'memory_invalidate', 'memory_list', 'memory_pending', 'memory_review', 'memory_search', 'memory_update', 'memory_write']);
+    assert.deepEqual(names, ['memory_confirm', 'memory_export_md', 'memory_forget', 'memory_graph', 'memory_import_md', 'memory_invalidate', 'memory_lineage', 'memory_list', 'memory_pending', 'memory_pin', 'memory_review', 'memory_search', 'memory_update', 'memory_write', 'memory_write_batch']);
 
     // write
     const wRes = await client.callTool({ name: 'memory_write', arguments: { text: 'MCP 경유로 저장된 사실: 주말엔 등산을 한다' } });

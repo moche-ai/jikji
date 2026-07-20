@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS facts (
   kind             TEXT NOT NULL DEFAULT 'semantic',
   scope_kind       TEXT NOT NULL DEFAULT 'user' CHECK (scope_kind IN ('user','workspace','project','session')),
   scope_ref        TEXT,
+  pinned           INTEGER NOT NULL DEFAULT 0,
   created_at       INTEGER NOT NULL,
   PRIMARY KEY (namespace_id, fact_id)
 );
@@ -240,6 +241,9 @@ export function openStore(dbPath) {
   }
   if (!db.prepare('PRAGMA table_info(outbox)').all().some((c) => c.name === 'lease_token')) {
     db.exec('ALTER TABLE outbox ADD COLUMN lease_token TEXT');
+  }
+  if (!db.prepare('PRAGMA table_info(facts)').all().some((c) => c.name === 'pinned')) {
+    db.exec('ALTER TABLE facts ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0');
   }
 
   // 모든 논리 쓰기는 BEGIN IMMEDIATE (seq 할당·insert 원자화, P1-1).
@@ -485,9 +489,11 @@ export function openStore(dbPath) {
                        WHERE f.namespace_id=? AND f.fact_id=?`).get(ns, factId) || null;
   }
   function listActive(ns, { limit = 50, offset = 0 } = {}) {
-    return db.prepare(`SELECT r.fact_id, r.revision_id, r.text, r.status, r.fact_confidence, r.recorded_at
+    // pin 된 것 우선 노출(중요 기억 상단), 그 다음 최신순.
+    return db.prepare(`SELECT r.fact_id, r.revision_id, r.text, r.status, r.fact_confidence, r.recorded_at, f.pinned
                        FROM facts f JOIN fact_revisions r ON r.namespace_id=f.namespace_id AND r.revision_id=f.head_revision_id
-                       WHERE f.namespace_id=? AND r.status=? ORDER BY r.recorded_at DESC LIMIT ? OFFSET ?`).all(ns, STATUS.ACTIVE, limit, offset);
+                       WHERE f.namespace_id=? AND r.status=? ORDER BY f.pinned DESC, r.recorded_at DESC LIMIT ? OFFSET ?`)
+      .all(ns, STATUS.ACTIVE, limit, offset).map((r) => ({ ...r, pinned: !!r.pinned }));
   }
   /** 검색 후보 = active head + moderation approved (quarantine/pending 제외). scopeKind 필터 옵션. */
   function activeApprovedRevisions(ns, { scopeKind = null } = {}) {
@@ -621,7 +627,7 @@ export function openStore(dbPath) {
 
   /** 검색 후보 = active + disputed head (moderation approved). conflict_set_id 동봉(disputed 묶음 반환용). */
   function searchableRevisions(ns, { scopeKind = null } = {}) {
-    const base = `SELECT r.fact_id, r.revision_id, r.text, r.fact_confidence, r.status, f.scope_kind, f.scope_ref,
+    const base = `SELECT r.fact_id, r.revision_id, r.text, r.fact_confidence, r.status, f.scope_kind, f.scope_ref, f.pinned,
                     (SELECT cm.set_id FROM conflict_members cm WHERE cm.namespace_id=r.namespace_id AND cm.revision_id=r.revision_id LIMIT 1) AS conflict_set_id
                     FROM facts f
                     JOIN fact_revisions r ON r.namespace_id=f.namespace_id AND r.revision_id=f.head_revision_id
@@ -681,10 +687,31 @@ export function openStore(dbPath) {
     });
   }
 
+  // ── 고급: 이력(lineage) / pin(고정) — Curator 파워유저 op 대응 ──
+
+  /** 기억 이력: 전 리비전(시간순)·이벤트·대체관계 — 설명가능성/신뢰. 데이터는 이미 저장돼 있음. */
+  function lineage(ns, factId) {
+    const fact = db.prepare('SELECT fact_id, head_revision_id, version, kind, scope_kind, scope_ref, pinned, created_at FROM facts WHERE namespace_id=? AND fact_id=?').get(ns, factId);
+    if (!fact) return null;
+    const revisions = db.prepare(`SELECT revision_id, text, status, author_type, recorded_at, retracted_at, fact_confidence
+                                    FROM fact_revisions WHERE namespace_id=? AND fact_id=? ORDER BY recorded_at ASC`).all(ns, factId);
+    const events = db.prepare('SELECT type, revision_id, at FROM fact_events WHERE namespace_id=? AND fact_id=? ORDER BY seq ASC').all(ns, factId);
+    const supersedes = db.prepare(`SELECT rs.revision_id, rs.superseded_revision_id FROM revision_supersedes rs
+                                     JOIN fact_revisions r ON r.namespace_id=rs.namespace_id AND r.revision_id=rs.revision_id
+                                    WHERE rs.namespace_id=? AND r.fact_id=?`).all(ns, factId);
+    return { ...fact, pinned: !!fact.pinned, revisions, events, supersedes };
+  }
+  /** pin: 중요 기억 고정 — 자동 supersede/모순 disputed 후보에서 제외 + 목록 상단(향후 decay 면제). */
+  function setPinned(ns, factId, pinned) {
+    const r = db.prepare('UPDATE facts SET pinned=? WHERE namespace_id=? AND fact_id=?').run(pinned ? 1 : 0, ns, factId);
+    if (r.changes !== 1) { const e = new Error('fact_not_found'); e.code = 404; throw e; }
+    return { fact_id: factId, pinned: !!pinned };
+  }
+
   function close() { db.close(); }
 
   return {
-    SCHEMA_VERSION, contentHash, kpis, createInvite, redeemInvite, redeemInviteWithKey, listInvites,
+    SCHEMA_VERSION, contentHash, kpis, lineage, setPinned, createInvite, redeemInvite, redeemInviteWithKey, listInvites,
     ensureNamespace, getNamespace, insertApiKey, resolveKey, revokeApiKey, listApiKeys,
     writeFact, processEmbeddings, processEmbeddingsAsync, namespacesWithPendingEmbeddings,
     decideModeration, retractFact, confirmRevision, forgetFact,

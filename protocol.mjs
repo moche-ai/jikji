@@ -54,6 +54,12 @@ export const TOOL_DESC = {
     'Export active memories as a human-readable Markdown digest (portability/trust). | 활성 기억을 md 다이제스트로 export.',
   memory_graph:
     'Explore the memory map — related memories linked by shared terms (optionally focused on a need). | 기억 지도 — 공유 용어로 이어진 관련 기억 탐색.',
+  memory_lineage:
+    'Inspect a fact\'s history — every revision, event, and supersede link (explainability). | 기억 이력(리비전·이벤트·대체) 조회.',
+  memory_pin:
+    'Pin (protect) or unpin an important fact — pinned facts are exempt from auto-supersede/dispute and shown first. | 중요 기억 고정/해제(자동 대체·disputed 면제).',
+  memory_write_batch:
+    'Store many facts in one call (each passes the write gate). | 여러 사실 배치 저장.',
   memory_forget:
     'Permanently delete a fact; cascades to derivatives and returns a deletion receipt. | 사실 영구 삭제(파생 연쇄 + 삭제 receipt).',
 };
