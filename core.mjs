@@ -24,6 +24,8 @@ const INJECTION_PATTERNS = [
   /<\/?(system|tool_call|function|assistant)>/i, /\[\[?system\]?\]/i,
 ];
 // secret 패턴(저장 거부 — 마스킹 아님). 확장.
+//   ★ReDoS 안전: 입력은 write 시 8000자 상한(413), 수량자 문자클래스가 뒤 구분자를 배제(JWT `.`/Bearer `=`가
+//   하드 앵커), 갭은 유계 `.{0,N}`(무한 `.*` 아님), 중첩 수량자 없음 → 카타스트로픽 백트래킹 불가(8000자 병리입력 실측 <0.3ms).
 const SECRET_PATTERNS = [
   /sk-(proj-)?[a-zA-Z0-9_-]{20,}/, /AKIA[0-9A-Z]{16}/, /gh[pousr]_[A-Za-z0-9]{30,}/, /github_pat_[A-Za-z0-9_]{40,}/,
   /-----BEGIN [A-Z ]*PRIVATE KEY-----/, /xox[baprs]-[A-Za-z0-9-]{10,}/,
@@ -41,9 +43,25 @@ function canonical(obj) {
   return crypto.createHash('sha256').update(JSON.stringify(keys.map((k) => [k, obj[k]]))).digest('hex');
 }
 
+// 경량 서킷브레이커(프로세스-로컬): dense/리랭커 백엔드가 연속 threshold 회 실패하면 cooldown 동안 호출을
+//   **스킵(fail-fast)** — 죽은 서비스에 매 쿼리 풀 타임아웃을 물고 두드리는 지연 절벽을 막는다. fail-open 은 유지
+//   (dense/리랭커 없이도 검색은 계속). success 시 즉시 리셋(half-open 없이 낙관 복귀 — 단순·충분).
+function makeBreaker({ threshold = 3, cooldownMs = 10000 } = {}) {
+  let fails = 0, openUntil = 0;
+  return {
+    allow(now) { return now >= openUntil; },
+    success() { fails = 0; openUntil = 0; },
+    // 이번 실패로 회로가 **새로** 열렸으면 true(1회성 트립 이벤트 발행용).
+    failure(now) { fails += 1; if (now >= openUntil && fails >= threshold) { openUntil = now + cooldownMs; return true; } return false; },
+  };
+}
+
 export class MemoryCore {
-  constructor(store, embedder, { logger = null, reranker = null } = {}) {
+  constructor(store, embedder, { logger = null, reranker = null, breaker = {} } = {}) {
     this.store = store; this.embedder = embedder; this.reranker = reranker; this.logger = logger;
+    const bopt = { threshold: 3, cooldownMs: 10000, ...breaker };
+    this._embedBreaker = makeBreaker(bopt);      // dense 임베더(:8138) 서킷브레이커
+    this._rerankBreaker = makeBreaker(bopt);     // 리랭커(:8003) 서킷브레이커
   }
 
   ensureTenant(namespaceId, ownerScope, policy = { auto_approve: true, default_no_train: true }) {
@@ -288,16 +306,28 @@ export class MemoryCore {
     //  임베더 장애/미기동 = dense 생략하고 bm25 로 fail-open. 차원 불일치·cosine≤0 후보는 dense 순위 제외(Codex #5).
     let denseScores = new Map();
     let denseOk = true;
-    try {
-      const [qv] = await this.embedder.embed([queryText], { instruction });
-      const qdim = qv.length;
-      for (const r of rows) {
-        const v = this.store.getVector(ctx.namespaceId, r.revision_id);
-        if (!v || v.dim !== qdim) continue;               // 벡터 없음/차원 불일치 → dense 생략
-        const c = cosine(qv, unpackVector(v.vector, v.dim));
-        if (c > 0) denseScores.set(r.revision_id, c);      // 무관/음수 후보는 dense 순위 부여 안 함
+    const degraded = [];                                   // 이번 검색의 성능저하 사유(가시성 — 텔레메트리에 실림)
+    if (!this._embedBreaker.allow(Date.now())) {
+      denseOk = false; degraded.push('embedder_circuit_open');   // 회로 open → 임베더 호출 스킵(fail-fast, 타임아웃 회피)
+    } else {
+      try {
+        const [qv] = await this.embedder.embed([queryText], { instruction });
+        const qdim = qv.length;
+        for (const r of rows) {
+          const v = this.store.getVector(ctx.namespaceId, r.revision_id);
+          if (!v || v.dim !== qdim) continue;             // 벡터 없음/차원 불일치 → dense 생략
+          const c = cosine(qv, unpackVector(v.vector, v.dim));
+          if (c > 0) denseScores.set(r.revision_id, c);    // 무관/음수 후보는 dense 순위 부여 안 함
+        }
+        this._embedBreaker.success();
+      } catch {
+        denseOk = false; degraded.push('embedder_failed');  // 임베더 장애 = dense 생략, bm25 로 fail-open
+        if (this._embedBreaker.failure(Date.now())) {
+          emit({ event: 'memory.search.degraded', ok: false, reason: 'embedder_circuit_open', dependency: 'embedder',
+            actor_pseudonym: ctx.actorPseudonym, namespace_hash: labelHash(ctx.namespaceId) }, this.logger);
+        }
       }
-    } catch { denseOk = false; }   // 임베더 장애 = dense 생략, bm25 로 fail-open
+    }
 
     // ② bm25(lexical, on-the-fly — per-namespace 소규모).
     const bm25 = bm25Scores(queryText, rows.map((r) => ({ id: r.revision_id, text: r.text })));
@@ -326,14 +356,25 @@ export class MemoryCore {
     const rerankOn = this.reranker && policy.reranker !== false;               // 기본 ON(명시 false 만 끔)
     const doRerank = rerankOn && (policy.rerank_skip_easy ? classifyHard(denseScores) : true);
     if (doRerank) {
-      const topN = order.slice(0, 20).map((id) => ({ id, text: byId.get(id).text }));
-      try {
-        const rs = await this.reranker.rerank(queryText, topN);
-        const rr = topN.map((d, i) => [d.id, Number(rs[i]) || 0]).sort((a, b) => b[1] - a[1]);
-        order = [...rr.map(([id]) => id), ...order.filter((id) => !topN.some((d) => d.id === id))];
-        rerankedSet = new Set(topN.map((d) => d.id));
-        tier = 'reranker';
-      } catch { /* fail-open: 융합 순서 유지 */ }
+      if (!this._rerankBreaker.allow(Date.now())) {
+        degraded.push('reranker_circuit_open');            // 회로 open → 리랭커 스킵(fail-fast). 융합 순서 유지.
+      } else {
+        const topN = order.slice(0, 20).map((id) => ({ id, text: byId.get(id).text }));
+        try {
+          const rs = await this.reranker.rerank(queryText, topN);
+          const rr = topN.map((d, i) => [d.id, Number(rs[i]) || 0]).sort((a, b) => b[1] - a[1]);
+          order = [...rr.map(([id]) => id), ...order.filter((id) => !topN.some((d) => d.id === id))];
+          rerankedSet = new Set(topN.map((d) => d.id));
+          tier = 'reranker';
+          this._rerankBreaker.success();
+        } catch {
+          degraded.push('reranker_failed');                // fail-open: 융합 순서 유지(스킵-because-easy 와 구분됨)
+          if (this._rerankBreaker.failure(Date.now())) {
+            emit({ event: 'memory.search.degraded', ok: false, reason: 'reranker_circuit_open', dependency: 'reranker',
+              actor_pseudonym: ctx.actorPseudonym, namespace_hash: labelHash(ctx.namespaceId) }, this.logger);
+          }
+        }
+      }
     }
 
     const results = order.slice(0, kk).map((id) => {
@@ -355,9 +396,10 @@ export class MemoryCore {
     });
 
     emit({ event: 'memory.search', ok: true, result_count: results.length, tier,
+      degraded: degraded.length ? degraded : undefined,   // 저하 사유(정상 경로엔 undefined → 이벤트 shape 불변)
       actor_pseudonym: ctx.actorPseudonym, namespace_hash: labelHash(ctx.namespaceId), latency_ms: Date.now() - t0,
       input_units: queryText.length, cost_usd_notional: notionalCost({ tier: tier === 'reranker' ? 'rerank' : 'embed', inputUnits: queryText.length }) }, this.logger);
-    return { results, query_optimized: true, tier };
+    return { results, query_optimized: true, tier, ...(degraded.length ? { degraded } : {}) };
   }
 
   confirm(ctx, { revision_id }) {

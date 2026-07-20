@@ -265,19 +265,26 @@ const ACTIVE_STORES = ['facts', 'fact_revisions', 'fact_vectors', 'fact_images',
 
 export function openStore(dbPath) {
   const db = new DatabaseSync(dbPath);
-  db.exec(DDL);
-  const uv = db.prepare('PRAGMA user_version').get()?.user_version ?? 0;
-  if (uv < SCHEMA_VERSION) db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
-  // 방어적 마이그레이션(pre-deploy dev DB): base_version 컬럼 부재 시 추가(기본 0, 안전).
-  // FK 추가는 SQLite ALTER 불가 → fresh DB 에서만 완비. 프로덕션 jikji.db 는 v1 로 신규 생성(README).
-  if (!db.prepare('PRAGMA table_info(fact_revisions)').all().some((c) => c.name === 'base_version')) {
-    db.exec('ALTER TABLE fact_revisions ADD COLUMN base_version INTEGER NOT NULL DEFAULT 0');
-  }
-  if (!db.prepare('PRAGMA table_info(outbox)').all().some((c) => c.name === 'lease_token')) {
-    db.exec('ALTER TABLE outbox ADD COLUMN lease_token TEXT');
-  }
-  if (!db.prepare('PRAGMA table_info(facts)').all().some((c) => c.name === 'pinned')) {
-    db.exec('ALTER TABLE facts ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0');
+  db.exec(DDL);   // PRAGMA(journal_mode=WAL·busy_timeout=5000·…) + CREATE TABLE IF NOT EXISTS(멱등) — 트랜잭션 밖(WAL 전환은 tx 내 불가).
+  // ── 방어적 컬럼 마이그레이션: 단일 BEGIN IMMEDIATE 로 감싸 **프로세스 간 경쟁 제거**(check-then-ALTER TOCTOU 차단).
+  //   server·gateway·dashboard 가 같은 DB 를 동시 부팅해도 쓰기락 보유 프로세스만 마이그레이트하고, 나머지는
+  //   busy_timeout(5s) 만큼 대기 후 완료본을 관찰한다. duplicate-column 은 방어적으로 무시(멱등·가역).
+  //   (FK 추가는 SQLite ALTER 불가 → fresh DB 에서만 완비. 프로덕션 jikji.db 는 v1 로 신규 생성 — README.)
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const uv = db.prepare('PRAGMA user_version').get()?.user_version ?? 0;
+    if (uv < SCHEMA_VERSION) db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+    const addColIfMissing = (table, col, ddl) => {
+      if (db.prepare(`PRAGMA table_info(${table})`).all().some((c) => c.name === col)) return;
+      try { db.exec(ddl); } catch (e) { if (!/duplicate column/i.test(String(e?.message))) throw e; }
+    };
+    addColIfMissing('fact_revisions', 'base_version', 'ALTER TABLE fact_revisions ADD COLUMN base_version INTEGER NOT NULL DEFAULT 0');
+    addColIfMissing('outbox', 'lease_token', 'ALTER TABLE outbox ADD COLUMN lease_token TEXT');
+    addColIfMissing('facts', 'pinned', 'ALTER TABLE facts ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0');
+    db.exec('COMMIT');
+  } catch (e) {
+    try { db.exec('ROLLBACK'); } catch { /* noop */ }
+    throw e;
   }
 
   // 모든 논리 쓰기는 BEGIN IMMEDIATE (seq 할당·insert 원자화, P1-1).
