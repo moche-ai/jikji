@@ -173,8 +173,67 @@ export class MemoryCore {
     return res;
   }
 
+  // ── WRITE IMAGE (멀티모달) — 이미지+캡션 저장. 이미지 임베딩(VL, 통합 공간)으로 텍스트질의 교차모달 회수 ──
+  //  캡션=fact 텍스트(BM25·리비전·설명가능성), 벡터=이미지 임베딩(dense). 이미지 바이트는 fact_images 에.
+  //  self·auto_approve(=approved) 경로만 지원(MVP) — pending/quarantine 은 바이트만 보관, 벡터/색인 없음.
+  async writeImage(ctx, { caption = '', image, mime = null, scopeKind = 'user', scopeRef = null }) {
+    requireScope(ctx, 'write');
+    this._meter(ctx, 'write');
+    const t0 = Date.now();
+    if (!this.embedder.multimodal || typeof this.embedder.embedImage !== 'function') { const e = new Error('embedder_not_multimodal'); e.code = 501; throw e; }
+    if (typeof image !== 'string' || !image.trim()) { const e = new Error('image_required'); e.code = 422; throw e; }
+    const cap = typeof caption === 'string' ? caption : '';
+    if (cap.length > 2000) { const e = new Error('caption_too_large'); e.code = 413; throw e; }
+    // 캡션도 write 게이트(시크릿/injection) — 이미지 자체는 스캔 대상 아님(바이트).
+    const scan = normalizeForScan(cap);
+    if (SECRET_PATTERNS.some((re) => re.test(scan)) || SECRET_PATTERNS.some((re) => re.test(cap))) { const e = new Error('secret_content_rejected'); e.code = 422; throw e; }
+    const risk = INJECTION_PATTERNS.filter((re) => re.test(scan)).map((re) => re.source.slice(0, 24));
+    const authorType = ctx.authorType;
+    if (!authorType) { const e = new Error('author_type_required'); e.code = 500; throw e; }
+    const moderationState = this._moderate(ctx.namespaceId, authorType, risk);
+
+    // 기억 수 캡(양 차등만).
+    const plan = this._plan(ctx.namespaceId);
+    if (this.store.countMemories(ctx.namespaceId) >= plan.max_memories) { const e = new Error('memory_quota_exceeded'); e.code = 402; throw e; }
+
+    // 이미지 임베딩(await — VL 모델 HTTP). 실패 = 502(write 취소, 부분저장 없음).
+    let vec;
+    try { vec = await this.embedder.embedImage(image); }
+    catch { const e = new Error('image_embed_failed'); e.code = 502; throw e; }
+
+    // caption 이 비면 색인 텍스트 최소값(빈 텍스트 writeFact 거부 회피). BM25 는 이미지엔 약하고 dense 가 주력.
+    const text = cap.trim() || '[image]';
+    const res = this.store.writeFact(ctx.namespaceId, {
+      text, kind: 'episodic', scopeKind, scopeRef, authorType, moderationState,
+      riskFlags: risk.length ? risk : null, noEmbed: true,   // 텍스트 임베딩 outbox 금지 — 이미지 벡터를 직접 저장
+    });
+
+    // 이미지 바이트 저장(모든 상태 — pending/quarantine 포함). data URL 만 디코드(http url은 바이트 미보관).
+    try {
+      const { mime: m, bytes } = decodeImage(image, mime);
+      this.store.putImage(ctx.namespaceId, res.revision_id, m, bytes);
+    } catch { /* http url 등 디코드 불가 = 바이트 미보관(임베딩은 성공) */ }
+    // 이미지 벡터는 상태 무관 저장(pending 이라도) — searchableRevisions 가 승인 head 만 노출하므로 안전.
+    //  fact_images 존재 → decideModeration 승인 시 텍스트 임베딩 outbox 스킵(이 벡터 보존). 승인 즉시 색인됨.
+    this.store.putVector(ctx.namespaceId, res.revision_id, { dim: vec.length, buf: packVector(vec), embedderId: this.embedder.id, embedderVer: this.embedder.ver });
+    this.store.audit(ctx.namespaceId, 'memory.write_image', ctx.actorPseudonym, { moderation: moderationState, risk: risk.length });
+    emit({ event: 'memory.write', ok: true, moderation: moderationState, reason: 'image',
+      actor_pseudonym: ctx.actorPseudonym, namespace_hash: labelHash(ctx.namespaceId), latency_ms: Date.now() - t0,
+      tier: 'vl', cost_usd_notional: notionalCost({ tier: 'embed', inputUnits: text.length }) }, this.logger);
+    return { ...res, image: true };
+  }
+
   // 새 리비전과 가장 유사한 다른 active fact(같은 scope, cosine≥임계, 다른 내용) → disputed 양쪽 보존.
   // scope 는 새 리비전 자신의 fact scope 에서 도출(update 든 create 든 정확 — Codex #6).
+  /** 저장된 이미지 바이트 회수(tenant 스코프) → data URL. 없으면 404. */
+  getImage(ctx, { revision_id }) {
+    requireScope(ctx, 'retrieve');
+    const img = this.store.getImage(ctx.namespaceId, revision_id);
+    if (!img) { const e = new Error('image_not_found'); e.code = 404; throw e; }
+    const b = img.bytes instanceof Uint8Array ? Buffer.from(img.bytes) : img.bytes;
+    return { mime: img.mime, data_url: `data:${img.mime};base64,${b.toString('base64')}` };
+  }
+
   _detectContradiction(ns, newRevisionId, threshold = null) {
     const nv = this.store.getVector(ns, newRevisionId);
     if (!nv) return null;
@@ -469,6 +528,18 @@ export class MemoryCore {
     emit({ event: 'memory.export', ok: true, result_count: items.length, actor_pseudonym: ctx.actorPseudonym, namespace_hash: labelHash(ctx.namespaceId) }, this.logger);
     return { markdown: lines.join('\n') + '\n', count: items.length };
   }
+}
+
+/** data URL(data:image/png;base64,...) → {mime, bytes}. 비 data URL(http 등)은 던짐(바이트 미보관). 크기 상한 12MB. */
+function decodeImage(image, mimeHint = null) {
+  const m = /^data:([\w./+-]+);base64,(.+)$/s.exec(String(image).trim());
+  if (!m) { const e = new Error('not_a_data_url'); throw e; }
+  const mime = m[1] || mimeHint || 'application/octet-stream';
+  if (!/^image\//.test(mime)) { const e = new Error('not_an_image'); e.code = 422; throw e; }
+  const bytes = Buffer.from(m[2], 'base64');
+  if (bytes.length === 0) { const e = new Error('empty_image'); e.code = 422; throw e; }
+  if (bytes.length > 12 * 1024 * 1024) { const e = new Error('image_too_large'); e.code = 413; throw e; }
+  return { mime, bytes };
 }
 
 /** md → fact 단위: 헤딩/불릿/번호목록/비어있지 않은 문단을 개별 fact 텍스트로. 코드펜스는 통째 1단위. */

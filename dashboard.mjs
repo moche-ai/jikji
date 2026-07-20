@@ -57,7 +57,7 @@ export function createDashboard({ dbPath, prod = (process.env.JIKJI_ENV === 'pro
       let body = {};
       if (req.method === 'POST') {
         const chunks = []; let size = 0;
-        for await (const c of req) { size += c.length; if (size > 1_000_000) return json(res, 413, { error: 'too_large' }); chunks.push(c); }
+        for await (const c of req) { size += c.length; if (size > 20_000_000) return json(res, 413, { error: 'too_large' }); chunks.push(c); }   // 이미지 data URL(멀티모달) 수용 — loopback 전용
         const raw = Buffer.concat(chunks).toString('utf8');
         body = raw ? JSON.parse(raw) : {};
       }
@@ -89,6 +89,8 @@ export function createDashboard({ dbPath, prod = (process.env.JIKJI_ENV === 'pro
       case 'POST /api/review': return core.review(ctx, body);
       case 'POST /api/forget': return core.forget(ctx, body);
       case 'POST /api/import': return core.importMarkdown(ctx, body);
+      case 'POST /api/write_image': return await core.writeImage(ctx, { image: body.image, caption: body.caption, mime: body.mime, scopeKind: body.scope_kind, scopeRef: body.scope_ref });
+      case 'GET /api/image': return core.getImage(ctx, { revision_id: url.searchParams.get('revision_id') });
       default: return undefined;
     }
   }

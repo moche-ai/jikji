@@ -104,8 +104,39 @@ export class HttpEmbedder {
   }
 }
 
-/** env 기반 임베더 팩토리. JIKJI_EMBED_URL 있으면 HttpEmbedder(KURE-v1, async), 아니면 스캐폴드(sync). */
+/**
+ * 멀티모달 임베더 — vLLM Qwen3-VL /pooling 엔드포인트(텍스트+이미지 통합 임베딩 공간, 교차모달 검색).
+ * embed(texts) = 텍스트, embedImage(dataUrl) = 이미지. 같은 4096차원 공간이라 텍스트질의로 이미지 회수 가능.
+ */
+export class VlPoolingEmbedder {
+  constructor(url, { model = 'vlfp8', dim = 4096, timeoutMs = 8000 } = {}) {
+    this.base = String(url).replace(/\/(pooling|v1\/embeddings|embed)\/?$/, '');
+    this.url = this.base + '/pooling';
+    this.model = model; this.dim = dim; this.timeoutMs = timeoutMs;
+    this.id = `vl:${model}`; this.ver = model; this.isAsync = true; this.multimodal = true;
+  }
+  async _pool(content) {
+    const res = await fetch(this.url, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: this.model, messages: [{ role: 'user', content }] }),
+      signal: AbortSignal.timeout(this.timeoutMs),
+    });
+    if (!res.ok) throw new Error(`pool_http_${res.status}`);
+    const v = (await res.json())?.data?.[0]?.data;
+    if (!Array.isArray(v)) throw new Error('pool_bad_shape');
+    return Float32Array.from(v);
+  }
+  async embed(texts, { instruction = null } = {}) {
+    return Promise.all(texts.map((t) => this._pool([{ type: 'text', text: instruction ? `Instruct: ${instruction}\nQuery: ${t}` : t }])));
+  }
+  /** 이미지(data URL 또는 http url) → 임베딩. 텍스트와 같은 공간(교차모달). */
+  async embedImage(url) { return this._pool([{ type: 'image_url', image_url: { url } }]); }
+}
+
+/** env 기반 임베더 팩토리. /pooling(멀티모달 vLLM) > HttpEmbedder(text) > 스캐폴드(sync). */
 export function makeEmbedder(env = process.env) {
+  if (env.JIKJI_EMBED_URL && (env.JIKJI_EMBED_MODE === 'vl' || /\/pooling\/?$/.test(env.JIKJI_EMBED_URL)))
+    return new VlPoolingEmbedder(env.JIKJI_EMBED_URL, { model: env.JIKJI_EMBED_MODEL || 'vlfp8', dim: Number(env.JIKJI_EMBED_DIM || 4096) });
   if (env.JIKJI_EMBED_URL) return new HttpEmbedder(env.JIKJI_EMBED_URL, { dim: Number(env.JIKJI_EMBED_DIM || 1024) });
   return new LexicalEmbedder();
 }

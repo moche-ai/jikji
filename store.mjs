@@ -167,6 +167,16 @@ CREATE TABLE IF NOT EXISTS fact_vectors (
   FOREIGN KEY (namespace_id, revision_id) REFERENCES fact_revisions(namespace_id, revision_id) ON DELETE CASCADE
 );
 
+-- 멀티모달: 이미지 메모리의 원본 바이트(캡션=fact_revisions.text, 벡터=이미지 임베딩). 연쇄삭제.
+CREATE TABLE IF NOT EXISTS fact_images (
+  namespace_id TEXT NOT NULL,
+  revision_id  TEXT NOT NULL,
+  mime         TEXT NOT NULL,
+  bytes        BLOB NOT NULL,
+  PRIMARY KEY (namespace_id, revision_id),
+  FOREIGN KEY (namespace_id, revision_id) REFERENCES fact_revisions(namespace_id, revision_id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS entities (
   namespace_id TEXT NOT NULL, entity_id TEXT NOT NULL, name TEXT NOT NULL, kind TEXT, provenance TEXT,
   PRIMARY KEY (namespace_id, entity_id)
@@ -251,7 +261,7 @@ export const STATUS = Object.freeze({ ACTIVE: 'active', DISPUTED: 'disputed', SU
 export const MOD = Object.freeze({ PENDING: 'pending_review', APPROVED: 'approved', QUARANTINED: 'quarantined', REJECTED: 'rejected' });
 
 /** 활성계층 삭제 대상 저장소(0참조 검증에 모두 카운트). */
-const ACTIVE_STORES = ['facts', 'fact_revisions', 'fact_vectors', 'outbox', 'moderation', 'revision_supersedes', 'conflict_members', 'fact_events'];
+const ACTIVE_STORES = ['facts', 'fact_revisions', 'fact_vectors', 'fact_images', 'outbox', 'moderation', 'revision_supersedes', 'conflict_members', 'fact_events'];
 
 export function openStore(dbPath) {
   const db = new DatabaseSync(dbPath);
@@ -328,7 +338,7 @@ export function openStore(dbPath) {
     factId = null, text, kind = 'semantic', scopeKind = 'user', scopeRef = null,
     authorType, provenance = null, sourceRef = null, factConfidence = null,
     validFrom = null, validTo = null, moderationState, riskFlags = null,
-    expectedVersion = null, idempotencyKey = null, requestHash = null,
+    expectedVersion = null, idempotencyKey = null, requestHash = null, noEmbed = false,
   }) {
     return tx(() => {
       if (idempotencyKey) {
@@ -477,7 +487,12 @@ export function openStore(dbPath) {
                               WHERE namespace_id=? AND revision_id=? AND state IN (?, ?)`)
         .run(state, reviewedBy, Date.now(), ns, revisionId, MOD.PENDING, MOD.QUARANTINED);
       if (upd.changes !== 1) { const e = new Error('moderation_transition_forbidden'); e.code = 409; throw e; }
-      if (state === MOD.APPROVED) { setHeadCAS(ns, rev.fact_id, revisionId, rev.base_version); enqueueOutbox(ns, revisionId, 'embedding'); }
+      if (state === MOD.APPROVED) {
+        setHeadCAS(ns, rev.fact_id, revisionId, rev.base_version);
+        // 이미지 기억(멀티모달)은 벡터를 write 시점에 직접 저장 → 텍스트 임베딩 outbox 금지(이미지 벡터 덮어쓰기 방지).
+        const isImage = db.prepare('SELECT 1 FROM fact_images WHERE namespace_id=? AND revision_id=?').get(ns, revisionId);
+        if (!isImage) enqueueOutbox(ns, revisionId, 'embedding');
+      }
       return { revision_id: revisionId, moderation: state };
     });
   }
@@ -540,6 +555,20 @@ export function openStore(dbPath) {
   function getVector(ns, revisionId) {
     return db.prepare('SELECT dim, vector FROM fact_vectors WHERE namespace_id=? AND revision_id=?').get(ns, revisionId) || null;
   }
+  /** 멀티모달: 벡터 직접 저장(이미지 인라인 임베딩 — outbox 우회) + 이미지 바이트 저장. */
+  function putVector(ns, revisionId, { dim, buf, embedderId, embedderVer }) {
+    db.prepare(`INSERT INTO fact_vectors(namespace_id,revision_id,dim,vector,embedder_id,embedder_ver)
+                VALUES(?,?,?,?,?,?) ON CONFLICT(namespace_id,revision_id) DO UPDATE SET
+                  dim=excluded.dim, vector=excluded.vector, embedder_id=excluded.embedder_id, embedder_ver=excluded.embedder_ver`)
+      .run(ns, revisionId, dim, buf, embedderId, embedderVer);
+  }
+  function putImage(ns, revisionId, mime, bytes) {
+    db.prepare('INSERT INTO fact_images(namespace_id,revision_id,mime,bytes) VALUES(?,?,?,?) ON CONFLICT(namespace_id,revision_id) DO UPDATE SET mime=excluded.mime, bytes=excluded.bytes')
+      .run(ns, revisionId, mime, bytes);
+  }
+  function getImage(ns, revisionId) {
+    return db.prepare('SELECT mime, bytes FROM fact_images WHERE namespace_id=? AND revision_id=?').get(ns, revisionId) || null;
+  }
 
   // ── 삭제: DELETE facts → FK CASCADE(전 파생) + 전 저장소 0참조 검증(P0-4). 백업 상태 분리 ──
   function forgetFact(ns, factId, reason = null) {
@@ -589,7 +618,7 @@ export function openStore(dbPath) {
     n += db.prepare('SELECT COUNT(*) c FROM fact_revisions WHERE namespace_id=? AND fact_id=?').get(ns, factId).c;
     n += db.prepare('SELECT COUNT(*) c FROM fact_events WHERE namespace_id=? AND fact_id=?').get(ns, factId).c;
     for (const rid of rids) {
-      for (const t of ['fact_vectors', 'outbox', 'moderation', 'conflict_members']) {
+      for (const t of ['fact_vectors', 'fact_images', 'outbox', 'moderation', 'conflict_members']) {
         n += db.prepare(`SELECT COUNT(*) c FROM ${t} WHERE namespace_id=? AND revision_id=?`).get(ns, rid).c;
       }
       // revision_supersedes: 순방향(revision_id) + 역참조(superseded_revision_id) 둘 다(P0-4)
@@ -837,7 +866,7 @@ export function openStore(dbPath) {
     ensureNamespace, getNamespace, insertApiKey, resolveKey, revokeApiKey, listApiKeys,
     writeFact, processEmbeddings, processEmbeddingsAsync, namespacesWithPendingEmbeddings,
     decideModeration, retractFact, confirmRevision, forgetFact,
-    getHead, listActive, activeApprovedRevisions, searchableRevisions, getVector, countActiveRefs,
+    getHead, listActive, activeApprovedRevisions, searchableRevisions, getVector, putVector, putImage, getImage, countActiveRefs,
     listPending, findActiveByContentHash, markDisputed, recordImport,
     audit, recordConsent, close,
   };

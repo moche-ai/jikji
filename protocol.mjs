@@ -73,6 +73,8 @@ export const TOOL_DESC = {
     'Pin (protect) or unpin an important fact — pinned facts are exempt from auto-supersede/dispute and shown first. | 중요 기억 고정/해제(자동 대체·disputed 면제).',
   memory_write_batch:
     'Store many facts in one call (each passes the write gate). | 여러 사실 배치 저장.',
+  memory_write_image:
+    'Store an IMAGE memory (multimodal) with an optional caption; the image is embedded into the same space as text, so text queries retrieve it cross-modally (and vice versa). image = a data URL (data:image/png;base64,...). | 이미지 기억 저장(멀티모달) — 이미지가 텍스트와 같은 공간에 임베딩돼 텍스트 질의로 교차모달 회수. image=data URL.',
   memory_forget:
     'Permanently delete a fact; cascades to derivatives and returns a deletion receipt. | 사실 영구 삭제(파생 연쇄 + 삭제 receipt).',
 };

@@ -14,6 +14,9 @@ tool can share through the [Model Context Protocol](https://modelcontextprotocol
   personal memory through MCP (gateway & framework adapters are on the roadmap).
 - **Structured recall** — the retrieval path is built for hybrid search (BM25 + dense + graph +
   reranker) with scope-aware disambiguation across multiple projects.
+- **Multimodal memory** — store images (`memory_write_image`) alongside text. Images embed into the
+  **same vector space** as text (Qwen3-VL), so a text query retrieves a matching image cross-modally
+  (and vice versa), in Korean and English.
 - **Trust by design** — training use is **off by default**, memories are reviewable before they go
   live, fully exportable, and deletion cascades to every derivative.
 - **Korean-first** — retrieval quality is measured on a Korean long-term-memory benchmark; English is
@@ -27,7 +30,7 @@ The memory core is one embeddable module; MCP / gateway / adapters are thin entr
 |---|---|
 | `core.mjs` | **MemoryCore** (entry-agnostic): typed ops + policy enforcement (no-train, tenant isolation / IDOR, review, deletion, injection quarantine) + audit + telemetry. |
 | `store.mjs` | `node:sqlite` physical model — `facts` / `fact_revisions` / `moderation` (validity ≠ moderation as separate axes), transactional outbox, split deletion state, composite `(namespace_id, id)` keys, `BEGIN IMMEDIATE`, optimistic head CAS. Exposes a **repository capability only** (never the raw DB handle). |
-| `embed.mjs` | `Embedder` interface + `LexicalEmbedder` (deterministic, GPU-free scaffold fallback — honestly low quality; a real embedder swaps in behind the same interface). |
+| `embed.mjs` | `Embedder` interface + `LexicalEmbedder` (deterministic, GPU-free scaffold fallback — honestly low quality; a real embedder swaps in behind the same interface) + `VlPoolingEmbedder` (multimodal: text **and** images in one unified space via a vLLM Qwen3-VL `/pooling` endpoint). |
 | `telemetry.mjs` | Fire-and-forget forward to a configurable sink (no content, pseudonymous actor, notional cost — never mixed with real billing). |
 | `protocol.mjs` | Usage-protocol strings (MCP `instructions` + tool descriptions, EN/KO) — a **non-binding hint** per the MCP spec. |
 | `server.mjs` | **MCP entry point** — official `@modelcontextprotocol/sdk`, Streamable HTTP, API-key auth, Origin allowlist, loopback-only. |

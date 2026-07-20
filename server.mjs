@@ -52,12 +52,14 @@ function buildServer(core, ctx) {
   reg('memory_write_batch', { items: z.array(z.object({ text: z.string(), kind: z.enum(['semantic', 'episodic', 'procedural']).optional(), scope_kind: z.enum(['user', 'workspace', 'project', 'session']).optional(), scope_ref: z.string().optional(), idempotency_key: z.string().optional() })).min(1).max(200) },
     (a) => core.writeBatch(ctx, a));
   reg('memory_forget', { fact_id: z.string(), reason: z.string().optional() }, (a) => core.forget(ctx, a));
+  reg('memory_write_image', { image: z.string(), caption: z.string().optional(), mime: z.string().optional(), scope_kind: z.enum(['user', 'workspace', 'project', 'session']).optional(), scope_ref: z.string().optional() },
+    (a) => core.writeImage(ctx, { image: a.image, caption: a.caption, mime: a.mime, scopeKind: a.scope_kind, scopeRef: a.scope_ref }));
   return server;
 }
 
 async function readBody(req) {
   const chunks = []; let size = 0;
-  for await (const c of req) { size += c.length; if (size > 1_000_000) throw new Error('body_too_large'); chunks.push(c); }
+  for await (const c of req) { size += c.length; if (size > 20_000_000) throw new Error('body_too_large'); chunks.push(c); }   // 이미지 data URL(멀티모달) 수용 — loopback+Bearer 전용
   const raw = Buffer.concat(chunks).toString('utf8');
   return raw ? JSON.parse(raw) : undefined;
 }

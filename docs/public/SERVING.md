@@ -36,6 +36,25 @@ Reusing the platform's existing vLLM reranker already meets the SLO (~137 ms for
    (≥0.6.15 with the `120f` arch, or pin 0.6.12), CUDA graphs (no `--enforce-eager`),
    `--kv-cache-dtype fp8` (safe at head_dim=128), batch all candidates in one request.
 
+## Embedder model — multimodal (Qwen3-VL, FP8)
+
+The production embedder is **Qwen3-VL-Embedding-8B served in FP8 (E4M3)** on the native Blackwell FP8
+tensor cores. FP8 (not INT8) is the right quantization here: at low batch the embed forward is
+compute-bound, so FP8 gives ~2× BF16 at ~lossless quality, whereas INT8 is a VRAM-only play that can
+*slow* a compute-bound forward. Because it is a **VL** model, text and images land in **one unified
+4096-dim space** — the differentiator: a text query retrieves a matching image (and vice versa),
+cross-modally, in Korean and English.
+
+Serving: vLLM `--runner pooling --trust-remote-code`, image via `POST /pooling` with a chat
+`messages` payload (`image_url` = a `data:` URL, or `text`), returning `data[0].data` (the pooled
+embedding). `VlPoolingEmbedder` (`embed.mjs`) speaks this; select it with `JIKJI_EMBED_MODE=vl` (or a
+URL ending in `/pooling`). The reranker stays **BF16 / not quantized** — reranking is the final,
+precision-sensitive ordering step and the quality floor, so it is never quantized.
+
+Verified end-to-end: writing red/blue images with neutral captions, then querying "빨간 사각형" /
+"a red square" / "파란 원" / "a blue circle" returns the correct image purely via the image vector
+(`retrieval_reasons = [dense]`), in both languages.
+
 ## Reranker model
 
 Keep **Qwen3-Reranker-8B**. On the Korean instructkr benchmark (seq-cls heads) it leads: 8B NDCG@1
