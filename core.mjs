@@ -11,7 +11,7 @@ import crypto from 'node:crypto';
 import { MOD, STATUS } from './store.mjs';
 import { packVector, unpackVector, cosine } from './embed.mjs';
 import { emit, notionalCost, labelHash } from './telemetry.mjs';
-import { bm25Scores, rrfFuse, classifyHard, buildGraph } from './search.mjs';
+import { bm25Scores, rrfFuse, classifyHard, buildGraph, temporalWeight, pickInstruction } from './search.mjs';
 
 // injection 패턴(risk signal — 승인 근거 아님)
 const INJECTION_PATTERNS = [
@@ -161,6 +161,10 @@ export class MemoryCore {
 
     const rows = this.store.searchableRevisions(ctx.namespaceId);   // active+disputed head, quarantine/pending 제외
     const byId = new Map(rows.map((r) => [r.revision_id, r]));
+    const policy = this.store.getNamespace(ctx.namespaceId)?.policy || {};
+    // ★케이스별 임베딩(instruction) — 기본 OFF. 다양한 코퍼스엔 유리하나 같은-주제 distractor 는 오히려 변별↓
+    //  (평가 하드셋 0.71→0.57 회귀 관측). 측정으로 이득 증명된 네임스페이스만 policy.case_instruction 로 ON.
+    const instruction = policy.case_instruction ? pickInstruction(need, task_context) : null;
 
     // ② dense: 쿼리 임베딩(await — 실모델 HTTP) + 저장 벡터 cosine. 실 임베더는 이미 로드된 서비스(jikji-embed)를
     //  직접 호출 — 쿼리 임베딩은 1회 forward 로 저렴하고, 서비스는 로드 시점에 admission 통과됨(무간섭은 서비스측 정본).
@@ -168,7 +172,7 @@ export class MemoryCore {
     let denseScores = new Map();
     let denseOk = true;
     try {
-      const [qv] = await this.embedder.embed([queryText]);
+      const [qv] = await this.embedder.embed([queryText], { instruction });
       const qdim = qv.length;
       for (const r of rows) {
         const v = this.store.getVector(ctx.namespaceId, r.revision_id);
@@ -183,12 +187,23 @@ export class MemoryCore {
 
     // RRF 융합(dense ⊕ bm25). 둘 다 비면 후보 없음.
     const fused = rrfFuse([denseScores, bm25].filter((m) => m.size > 0));
-    let order = [...fused.keys()].sort((a, b) => fused.get(b) - fused.get(a));
+
+    // ★시계열 스코어링(Curator 단순 decay 초월): RRF × (recency·confirm·stale·pin 가중). 유저별 params 로 튜닝(§매번 최적화).
+    //  eval 은 동시각·미confirm 이라 배수 균일 → 회귀 없음. 실사용에선 최신·확인된·고정 기억이 상위로.
+    const now = Date.now();
+    const twOpts = { ...(policy.temporal || {}), ...(this.store.getSearchParams?.(ctx.namespaceId)?.temporal || {}) };
+    const adjusted = new Map();
+    for (const [id, s] of fused) {
+      const m = byId.get(id);
+      let w = temporalWeight({ recorded_at: m.recorded_at, confirms: m.confirms }, now, twOpts);
+      if (m.pinned) w *= 1.15;                        // pin = 약간 상단(중요 기억 보호)
+      adjusted.set(id, s * w);
+    }
+    let order = [...adjusted.keys()].sort((a, b) => adjusted.get(b) - adjusted.get(a));
 
     // ④ 대형 리랭커 — ★품질 단일 등급: 기본 = **전 질의 적용**(2026-07-20 유저 확정). 티어·난이도 차등 금지.
     //   스킵(classifyHard=easy)은 평가셋에서 '리랭커 유무 결과 동일'이 증명된 구간만 opt-in(policy.rerank_skip_easy)
     //   — 지연 최적화이지 품질 차등 아님. 리랭커 장애 = fail-open(융합 순서 유지).
-    const policy = this.store.getNamespace(ctx.namespaceId)?.policy || {};
     let tier = denseOk ? 'hybrid' : 'bm25';
     let rerankedSet = null;
     const rerankOn = this.reranker && policy.reranker !== false;               // 기본 ON(명시 false 만 끔)
@@ -213,7 +228,7 @@ export class MemoryCore {
       return {
         fact: r.text, fact_id: r.fact_id, revision_id: r.revision_id,
         fact_confidence: r.fact_confidence ?? null,
-        retrieval_score: +(fused.get(id) ?? 0).toFixed(6),   // RRF 점수(확률 아님)
+        retrieval_score: +(adjusted.get(id) ?? 0).toFixed(6),   // RRF × 시계열 가중(확률 아님)
         validity_status: r.status,                            // active | disputed
         conflict_set_id: r.conflict_set_id || null,
         scope_kind: r.scope_kind,
@@ -231,7 +246,10 @@ export class MemoryCore {
   confirm(ctx, { revision_id }) {
     requireScope(ctx, 'retrieve');
     const r = this.store.confirmRevision(ctx.namespaceId, revision_id);
-    if (r.ok) this.store.audit(ctx.namespaceId, 'memory.confirm', ctx.actorPseudonym);   // 내구성 KPI(감사는 forget 캐스케이드 안 됨)
+    if (r.ok) {
+      this.store.audit(ctx.namespaceId, 'memory.confirm', ctx.actorPseudonym);   // 내구성 KPI(감사는 forget 캐스케이드 안 됨)
+      try { this.store.tuneOnConfirm(ctx.namespaceId, revision_id); } catch { /* 튜닝 실패는 confirm 를 막지 않음 */ }   // ★매번 최적화
+    }
     emit({ event: 'memory.confirm', ok: r.ok, actor_pseudonym: ctx.actorPseudonym, namespace_hash: labelHash(ctx.namespaceId) }, this.logger);
     return r;
   }
@@ -322,6 +340,14 @@ export class MemoryCore {
     emit({ event: 'memory.pin', ok: true, actor_pseudonym: ctx.actorPseudonym, namespace_hash: labelHash(ctx.namespaceId) }, this.logger);
     return r;
   }
+  /** ★잘못된 정보 CRUD: hygiene — stale/중복/충돌을 표면화(에이전트/유저가 invalidate/update/forget 로 정리). */
+  hygiene(ctx, { staleDays = 180, limit = 50 } = {}) {
+    requireScope(ctx, 'retrieve');
+    const h = this.store.hygiene(ctx.namespaceId, { staleDays, limit });
+    emit({ event: 'memory.hygiene', ok: true, result_count: h.counts.stale + h.counts.duplicates + h.counts.conflicts, actor_pseudonym: ctx.actorPseudonym, namespace_hash: labelHash(ctx.namespaceId) }, this.logger);
+    return h;
+  }
+
   /** 고급: 배치 저장 — 여러 사실을 한 번에(각각 write 게이트 통과). 부분 성공 허용. */
   writeBatch(ctx, { items }) {
     requireScope(ctx, 'write');

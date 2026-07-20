@@ -44,6 +44,8 @@ function buildServer(core, ctx) {
   reg('memory_export_md', { limit: z.number().int().min(1).max(5000).optional() }, (a) => core.exportMarkdown(ctx, a));
   reg('memory_graph', { need: z.string().optional(), limit: z.number().int().min(1).max(500).optional() }, (a) => core.graph(ctx, a));
   reg('memory_lineage', { fact_id: z.string() }, (a) => core.lineage(ctx, a));
+  reg('memory_hygiene', { stale_days: z.number().int().min(1).optional(), limit: z.number().int().min(1).max(200).optional() },
+    (a) => core.hygiene(ctx, { staleDays: a.stale_days, limit: a.limit }));
   reg('memory_pin', { fact_id: z.string(), pinned: z.boolean().optional() }, (a) => core.pin(ctx, a));
   reg('memory_write_batch', { items: z.array(z.object({ text: z.string(), kind: z.enum(['semantic', 'episodic', 'procedural']).optional(), scope_kind: z.enum(['user', 'workspace', 'project', 'session']).optional(), scope_ref: z.string().optional() })).min(1).max(200) },
     (a) => core.writeBatch(ctx, a));

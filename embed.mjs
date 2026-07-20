@@ -66,8 +66,8 @@ export class LexicalEmbedder {
     this.ver = `scaffold-1-d${dim}`;
     this.isAsync = false;   // 동기 — write 시 인라인 드레인 가능(스캐폴드)
   }
-  /** @param {string[]} texts @returns {Float32Array[]} */
-  embed(texts) {
+  /** @param {string[]} texts @param {{instruction?:string}=} _opts (스캐폴드는 instruction 무시) @returns {Float32Array[]} */
+  embed(texts, _opts) {
     return texts.map((t) => {
       const v = new Float32Array(this.dim);
       for (const g of ngrams(t)) {
@@ -90,10 +90,10 @@ export class HttpEmbedder {
     this.url = url; this.model = model; this.dim = dim; this.timeoutMs = timeoutMs;
     this.id = `http:${model}`; this.ver = model; this.isAsync = true;
   }
-  async embed(texts) {
+  async embed(texts, { instruction = null } = {}) {
     const res = await fetch(this.url, {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model: this.model, input: texts }),
+      body: JSON.stringify({ model: this.model, input: texts, ...(instruction ? { instruction } : {}) }),   // 케이스별 임베딩(쿼리 instruction)
       signal: AbortSignal.timeout(this.timeoutMs),
     });
     if (!res.ok) throw new Error(`embed_http_${res.status}`);

@@ -60,8 +60,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(413, {"error": "too_many"})
         if not all(isinstance(t, str) for t in texts):
             return self._send(422, {"error": "input_must_be_strings"})
+        # case-appropriate embedding: a query instruction (Qwen3-Embedding instruction-tuning).
+        # Applied to QUERIES only; documents (indexing) send no instruction, per Qwen3-Embedding practice.
+        instruction = body.get("instruction")
+        enc = texts
+        if isinstance(instruction, str) and instruction:
+            enc = [f"Instruct: {instruction}\nQuery: {t}" for t in texts]
         with torch.inference_mode():
-            embs = model.encode(texts, normalize_embeddings=True, batch_size=32, convert_to_numpy=True)
+            embs = model.encode(enc, normalize_embeddings=True, batch_size=32, convert_to_numpy=True)
         self._send(200, {"embeddings": [e.tolist() for e in embs], "model": MODEL_ID, "dim": DIM})
 
     def log_message(self, *args):

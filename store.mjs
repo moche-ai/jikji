@@ -627,7 +627,8 @@ export function openStore(dbPath) {
 
   /** 검색 후보 = active + disputed head (moderation approved). conflict_set_id 동봉(disputed 묶음 반환용). */
   function searchableRevisions(ns, { scopeKind = null } = {}) {
-    const base = `SELECT r.fact_id, r.revision_id, r.text, r.fact_confidence, r.status, f.scope_kind, f.scope_ref, f.pinned,
+    const base = `SELECT r.fact_id, r.revision_id, r.text, r.fact_confidence, r.status, r.recorded_at, f.scope_kind, f.scope_ref, f.pinned,
+                    (SELECT COUNT(*) FROM fact_events e WHERE e.namespace_id=r.namespace_id AND e.revision_id=r.revision_id AND e.type='confirm') AS confirms,
                     (SELECT cm.set_id FROM conflict_members cm WHERE cm.namespace_id=r.namespace_id AND cm.revision_id=r.revision_id LIMIT 1) AS conflict_set_id
                     FROM facts f
                     JOIN fact_revisions r ON r.namespace_id=f.namespace_id AND r.revision_id=f.head_revision_id
@@ -701,6 +702,28 @@ export function openStore(dbPath) {
                                     WHERE rs.namespace_id=? AND r.fact_id=?`).all(ns, factId);
     return { ...fact, pinned: !!fact.pinned, revisions, events, supersedes };
   }
+  // ── ★매번 최적화: 채택 피드백 루프(고신뢰 신호=confirm 만) → 유저별 search_params 자동 튜닝 ──
+  function getSearchParams(ns) {
+    const r = db.prepare('SELECT k, rerank_threshold, scope_weights FROM search_params WHERE namespace_id=?').get(ns);
+    if (!r) return { k: 8, rerank_threshold: 0.5, temporal: {} };
+    let blob = {}; try { blob = JSON.parse(r.scope_weights || '{}'); } catch { /* noop */ }
+    return { k: r.k, rerank_threshold: r.rerank_threshold, temporal: blob.temporal || {} };
+  }
+  /** confirm 된 사실의 나이로 recency 가중을 넛지(EMA, bounded): 옛 사실을 확인=안정 선호→recency↓, 최신 확인→↑. */
+  function tuneOnConfirm(ns, revisionId) {
+    const rev = db.prepare('SELECT recorded_at FROM fact_revisions WHERE namespace_id=? AND revision_id=?').get(ns, revisionId);
+    if (!rev) return;
+    const ageDays = Math.max(0, (Date.now() - rev.recorded_at) / 86400000);
+    const cur = getSearchParams(ns);
+    const wR0 = typeof cur.temporal?.wRecency === 'number' ? cur.temporal.wRecency : 0.25;
+    const target = ageDays > 180 ? 0.1 : 0.35;
+    const wR = Math.max(0.05, Math.min(0.5, +(wR0 + 0.1 * (target - wR0)).toFixed(4)));   // EMA nudge, clamp
+    const blob = { temporal: { ...cur.temporal, wRecency: wR } };
+    db.prepare(`INSERT INTO search_params(namespace_id,k,rerank_threshold,scope_weights) VALUES(?,?,?,?)
+                ON CONFLICT(namespace_id) DO UPDATE SET scope_weights=excluded.scope_weights`)
+      .run(ns, cur.k || 8, cur.rerank_threshold || 0.5, JSON.stringify(blob));
+  }
+
   /** pin: 중요 기억 고정 — 자동 supersede/모순 disputed 후보에서 제외 + 목록 상단(향후 decay 면제). */
   function setPinned(ns, factId, pinned) {
     const r = db.prepare('UPDATE facts SET pinned=? WHERE namespace_id=? AND fact_id=?').run(pinned ? 1 : 0, ns, factId);
@@ -708,10 +731,32 @@ export function openStore(dbPath) {
     return { fact_id: factId, pinned: !!pinned };
   }
 
+  // ── ★잘못된 정보 CRUD: hygiene — stale/중복/충돌을 표면화해 능동 정리 유도(Curator enqueue_stale 초월) ──
+  function hygiene(ns, { staleDays = 180, limit = 50 } = {}) {
+    const cutoff = Date.now() - staleDays * 86400000;
+    // stale: 오래됐고 한 번도 confirm 안 됐고 pin 아닌 active head → 재검증/정리 후보.
+    const stale = db.prepare(`SELECT r.fact_id, r.text, r.recorded_at
+        FROM facts f JOIN fact_revisions r ON r.namespace_id=f.namespace_id AND r.revision_id=f.head_revision_id
+        WHERE f.namespace_id=? AND r.status=? AND f.pinned=0 AND r.recorded_at < ?
+          AND NOT EXISTS (SELECT 1 FROM fact_events e WHERE e.namespace_id=r.namespace_id AND e.revision_id=r.revision_id AND e.type='confirm')
+        ORDER BY r.recorded_at ASC LIMIT ?`).all(ns, STATUS.ACTIVE, cutoff, limit);
+    // 중복: 같은 content_hash 활성 head 2+ (dedup 우회분·구DB) → 병합/삭제 후보.
+    const duplicates = db.prepare(`SELECT r.content_hash AS hash, COUNT(*) AS count, GROUP_CONCAT(r.fact_id) AS fact_ids
+        FROM facts f JOIN fact_revisions r ON r.namespace_id=f.namespace_id AND r.revision_id=f.head_revision_id
+        WHERE f.namespace_id=? AND r.status=? GROUP BY r.content_hash HAVING count > 1 LIMIT ?`).all(ns, STATUS.ACTIVE, limit)
+      .map((d) => ({ ...d, fact_ids: (d.fact_ids || '').split(',') }));
+    // 충돌: disputed 묶음 → 유저가 하나 선택/정정.
+    const conflicts = db.prepare(`SELECT cs.set_id, GROUP_CONCAT(cm.revision_id) AS revision_ids
+        FROM conflict_sets cs JOIN conflict_members cm ON cm.namespace_id=cs.namespace_id AND cm.set_id=cs.set_id
+        WHERE cs.namespace_id=? GROUP BY cs.set_id LIMIT ?`).all(ns, limit)
+      .map((c) => ({ ...c, revision_ids: (c.revision_ids || '').split(',') }));
+    return { stale, duplicates, conflicts, counts: { stale: stale.length, duplicates: duplicates.length, conflicts: conflicts.length } };
+  }
+
   function close() { db.close(); }
 
   return {
-    SCHEMA_VERSION, contentHash, kpis, lineage, setPinned, createInvite, redeemInvite, redeemInviteWithKey, listInvites,
+    SCHEMA_VERSION, contentHash, kpis, lineage, setPinned, getSearchParams, tuneOnConfirm, hygiene, createInvite, redeemInvite, redeemInviteWithKey, listInvites,
     ensureNamespace, getNamespace, insertApiKey, resolveKey, revokeApiKey, listApiKeys,
     writeFact, processEmbeddings, processEmbeddingsAsync, namespacesWithPendingEmbeddings,
     decideModeration, retractFact, confirmRevision, forgetFact,

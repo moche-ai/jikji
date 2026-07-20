@@ -67,6 +67,41 @@ test('pin 보호: 고정 기억은 모순검출 disputed 대상에서 제외', (
   } finally { cleanup(); }
 });
 
+test('hygiene: disputed 충돌을 표면화', () => {
+  const { core, cleanup } = freshCore();
+  try {
+    core.ensureTenant('nsA', 'owner:a', { auto_approve: true, default_no_train: true, contradiction_detection: true, contradiction_threshold: 0.7 });
+    core.write(ctxOf('nsA'), { text: '사무실은 3층 301호이다' });
+    core.write(ctxOf('nsA'), { text: '사무실은 3층 305호이다' });
+    const h = core.hygiene(ctxOf('nsA'));
+    assert.ok(h.counts.conflicts >= 1, 'disputed 충돌 표면화');
+    assert.ok(h.conflicts[0].revision_ids.length === 2);
+  } finally { cleanup(); }
+});
+
+test('매번 최적화: confirm 이 유저별 search_params 를 튜닝', () => {
+  const { store, core, cleanup } = freshCore();
+  try {
+    core.ensureTenant('nsA', 'owner:a');
+    const w = core.write(ctxOf('nsA'), { text: '최근 사실' });
+    const before = store.getSearchParams('nsA').temporal?.wRecency;
+    core.confirm(ctxOf('nsA'), { revision_id: w.revision_id });   // 최근 사실 confirm → recency 넛지 상승
+    const after = store.getSearchParams('nsA').temporal?.wRecency;
+    assert.ok(typeof after === 'number' && after > (before || 0), 'confirm 후 wRecency 학습됨');
+  } finally { cleanup(); }
+});
+
+test('시계열 회귀 없음: 동시각·미confirm 사실은 배수 균일(recency 기본 OFF)', async () => {
+  const { core, cleanup } = freshCore();
+  try {
+    core.ensureTenant('nsA', 'owner:a');
+    core.write(ctxOf('nsA'), { text: '커피는 아메리카노를 좋아한다' });
+    core.write(ctxOf('nsA'), { text: '점심은 김치찌개' });
+    const s = await core.search(ctxOf('nsA'), { need: '좋아하는 커피 아메리카노' });
+    assert.ok(s.results[0].fact.includes('아메리카노'), '시계열이 관련도를 뒤엎지 않음');
+  } finally { cleanup(); }
+});
+
 test('writeBatch: 여러 사실 한 번에 + 부분 실패 허용', () => {
   const { core, cleanup } = freshCore();
   try {
