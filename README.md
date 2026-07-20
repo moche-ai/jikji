@@ -8,6 +8,11 @@ tool can share through the [Model Context Protocol](https://modelcontextprotocol
 > Named after *Jikji*, the world's oldest extant book printed with movable metal type
 > (Korea, 1377) — the original technology for making memory permanent.
 
+> **Agents:** [`AGENTS.md`](AGENTS.md) is the mandatory operating protocol — **search before every
+> task, remember after, invalidate/confirm to keep memory true.** Don't rely on the model choosing to
+> comply; install the strongest enforcement layer your runtime supports (Claude Code hooks / Cursor
+> rules / gateway) from [`clients/`](clients/).
+
 ## What it does
 
 - **One memory, every agent** — Claude Code, Cursor, custom agents and workflows share a single
