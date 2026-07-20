@@ -44,7 +44,7 @@ jobs:
           #    memory-service path in ANY tracked file (git grep = exactly what is committed).
           # Exclude .github/ itself: these guard patterns necessarily appear in this workflow file.
           # Secrets in workflow files are still covered by the gitleaks job.
-          if git grep -nIiE '/srv/jikji|core/curator|identity-app' -- . ':!.github/' ; then
+          if git grep -nIiE '/data/ai-services|/opt/moche|core/curator|moche-app|(app|mcp|dev-app)\.moche\.ai' -- . ':!.github/' ; then
             echo "::error::internal path / private-repo / proprietary-service reference leaked into a committed file"; exit 1
           fi
           # 2) Internal strategy docs and the handoff must never be committed.
