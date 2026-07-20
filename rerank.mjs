@@ -36,8 +36,15 @@ export class HttpReranker {
     });
     if (!res.ok) throw new Error(`rerank_http_${res.status}`);
     const j = await res.json();
-    if (!Array.isArray(j.scores) || j.scores.length !== docs.length) throw new Error('rerank_bad_shape');
-    return j.scores.map(Number);
+    // 응답 형식 유연 파싱: {scores:[...]}(자체) | {results:[{index,relevance_score}]}(Cohere/vLLM rerank) | {data:[{index,score}]}(vLLM score).
+    if (Array.isArray(j.scores) && j.scores.length === docs.length) return j.scores.map(Number);
+    const rows = Array.isArray(j.results) ? j.results : Array.isArray(j.data) ? j.data : null;
+    if (rows && rows.length === docs.length) {
+      const out = new Array(docs.length).fill(0);
+      for (const r of rows) { const i = r.index; if (Number.isInteger(i) && i >= 0 && i < docs.length) out[i] = Number(r.relevance_score ?? r.score ?? 0); }
+      return out;
+    }
+    throw new Error('rerank_bad_shape');
   }
 }
 
@@ -45,6 +52,6 @@ export class HttpReranker {
  *  ★품질: 리랭커는 A/B 승자 실모델일 때만 적용 — 스캐폴드(약한 overlap)를 품질처럼 전 질의 적용하지 않는다
  *  (스캐폴드는 테스트에서 명시 생성해 플러밍만 검증). 실 리랭커 미설정 = RRF 하이브리드(KURE-v1)로 충분. */
 export function makeReranker(env = process.env) {
-  if (env.JIKJI_RERANK_URL) return new HttpReranker(env.JIKJI_RERANK_URL);
+  if (env.JIKJI_RERANK_URL) return new HttpReranker(env.JIKJI_RERANK_URL, env.JIKJI_RERANK_MODEL ? { model: env.JIKJI_RERANK_MODEL } : {});
   return null;
 }

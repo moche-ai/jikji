@@ -32,15 +32,37 @@ if KIND == "qwen3":
     PREFIX = "<|im_start|>system\nJudge whether the Document meets the Query. Answer only \"yes\" or \"no\".<|im_end|>\n<|im_start|>user\n"
     SUFFIX = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
 
+    BATCH = int(os.environ.get("JIKJI_RERANK_BATCH", "16"))
+
     def score(query, docs):
+        # 배치 처리(단일 최대 지연 레버): 순차 N회 forward → 청크당 1회. left-padding 이라 last token = logits[:, -1].
+        texts = [f"{PREFIX}<Query>: {query}\n<Document>: {d}{SUFFIX}" for d in docs]
         out = []
-        for d in docs:
-            text = f"{PREFIX}<Query>: {query}\n<Document>: {d}{SUFFIX}"
-            ids = tok(text, return_tensors="pt", truncation=True, max_length=2048).to(device)
+        for i in range(0, len(texts), BATCH):
+            ids = tok(texts[i:i + BATCH], return_tensors="pt", truncation=True, max_length=2048, padding=True).to(device)
             with torch.inference_mode():
-                logits = lm(**ids).logits[0, -1]
-            yn = torch.tensor([logits[_no], logits[_yes]])
-            out.append(float(torch.softmax(yn, 0)[1]))
+                last = lm(**ids).logits[:, -1, :]                     # [b, vocab]
+            yn = torch.stack([last[:, _no], last[:, _yes]], dim=-1)   # [b, 2]
+            out.extend(torch.softmax(yn, dim=-1)[:, 1].float().tolist())
+        return out
+elif KIND == "qwen3-seqcls":
+    # seq-cls 변환본(tomaarsen/Qwen3-Reranker-8B-seq-cls): 1-output 헤드 → 거대 어휘 projection 제거.
+    # causal yes/no 대비 ~3배 빠름·정확도 무손실(연구 확인). 같은 프롬프트 템플릿 + 단일 로짓 sigmoid.
+    from transformers import AutoTokenizer, AutoModelForSequenceClassification
+    tok = AutoTokenizer.from_pretrained(MODEL_ID, padding_side="left")
+    lm = AutoModelForSequenceClassification.from_pretrained(MODEL_ID, torch_dtype=torch.float16, num_labels=1).to(device).eval()
+    PREFIX = "<|im_start|>system\nJudge whether the Document meets the Query. Answer only \"yes\" or \"no\".<|im_end|>\n<|im_start|>user\n"
+    SUFFIX = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    BATCH = int(os.environ.get("JIKJI_RERANK_BATCH", "16"))
+
+    def score(query, docs):
+        texts = [f"{PREFIX}<Query>: {query}\n<Document>: {d}{SUFFIX}" for d in docs]
+        out = []
+        for i in range(0, len(texts), BATCH):
+            ids = tok(texts[i:i + BATCH], return_tensors="pt", truncation=True, max_length=2048, padding=True).to(device)
+            with torch.inference_mode():
+                logits = lm(**ids).logits.squeeze(-1)                  # [b] (1-output 헤드)
+            out.extend(torch.sigmoid(logits).float().tolist())
         return out
 else:
     from sentence_transformers import CrossEncoder
