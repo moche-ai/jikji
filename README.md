@@ -67,8 +67,23 @@ SDK round-trip, and production fail-closed.
 
 ## Status
 
-Early development — local loopback proof of concept. External exposure, real embedding models, and any
-paid tier are deliberately gated. Closed beta planned; watch this repo.
+Early development — a working local (loopback) MVP:
+
+- **Memory core** — revisioned facts, dedup, temporal supersede, pending review, contradiction
+  detection (flagged), Markdown import/export.
+- **Retrieval** — hybrid BM25 + dense + RRF with an optional reranker tier, measured by a Korean
+  long-term-memory eval with a no-regression gate (`eval/`).
+- **MCP** — official SDK Streamable HTTP with scoped API keys, plus Claude Code / Cursor rule packs.
+- **Dashboard** — a small local UI to list, search, review, delete, import/export, and see KPIs.
+
+Retrieval currently runs an honest lexical scaffold; real embedding models (KURE-v1) and the reranker
+(Qwen3) swap in behind a GPU-admission gate and must clear the eval floor. External exposure, real
+models, any paid tier, and beta invites are deliberately user-gated. Closed beta planned; watch this repo.
+
+### Roadmap
+
+Memory-map visualization, an OpenAI-compatible gateway (cache-aware, fail-open), framework adapter
+packs, and on-device mode are next — developed alongside the closed beta.
 
 ## License
 
