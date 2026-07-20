@@ -64,6 +64,7 @@ export class LexicalEmbedder {
     this.dim = dim;
     this.id = 'lexical-hash';
     this.ver = `scaffold-1-d${dim}`;
+    this.isAsync = false;   // 동기 — write 시 인라인 드레인 가능(스캐폴드)
   }
   /** @param {string[]} texts @returns {Float32Array[]} */
   embed(texts) {
@@ -80,7 +81,31 @@ export class LexicalEmbedder {
   }
 }
 
+/**
+ * 실 임베더(GPU admission 게이트 뒤) — jikji-embed(:8108) KURE-v1 호출. async(Promise 반환, isAsync=true).
+ * 문서 벡터는 백그라운드 outbox 워커가 생성·저장, 검색은 저장 벡터를 읽고 쿼리만 이걸로 임베딩. embedder_ver 재색인 추적.
+ */
+export class HttpEmbedder {
+  constructor(url, { model = 'kure-v1', dim = 1024, timeoutMs = 5000 } = {}) {
+    this.url = url; this.model = model; this.dim = dim; this.timeoutMs = timeoutMs;
+    this.id = `http:${model}`; this.ver = model; this.isAsync = true;
+  }
+  async embed(texts) {
+    const res = await fetch(this.url, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: this.model, input: texts }),
+      signal: AbortSignal.timeout(this.timeoutMs),
+    });
+    if (!res.ok) throw new Error(`embed_http_${res.status}`);
+    const j = await res.json();
+    const arr = j.embeddings || j.data;
+    if (!Array.isArray(arr) || arr.length !== texts.length) throw new Error('embed_bad_shape');
+    return arr.map((v) => Float32Array.from(v.embedding || v));
+  }
+}
+
+/** env 기반 임베더 팩토리. JIKJI_EMBED_URL 있으면 HttpEmbedder(KURE-v1, async), 아니면 스캐폴드(sync). */
 export function makeEmbedder(env = process.env) {
-  // 1b: env.JIKJI_EMBED_URL 있으면 HttpEmbedder(KURE-v1). 스캐폴드는 항상 Lexical.
+  if (env.JIKJI_EMBED_URL) return new HttpEmbedder(env.JIKJI_EMBED_URL, { dim: Number(env.JIKJI_EMBED_DIM || 1024) });
   return new LexicalEmbedder();
 }

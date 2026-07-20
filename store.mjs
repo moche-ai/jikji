@@ -143,6 +143,7 @@ CREATE TABLE IF NOT EXISTS outbox (
   payload_ref        TEXT,
   status             TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','leased','done','dead')),
   lease_until        INTEGER,
+  lease_token        TEXT,
   attempt            INTEGER NOT NULL DEFAULT 0,
   next_retry_at      INTEGER,
   dead_letter        INTEGER NOT NULL DEFAULT 0,
@@ -224,6 +225,9 @@ export function openStore(dbPath) {
   // FK 추가는 SQLite ALTER 불가 → fresh DB 에서만 완비. 프로덕션 jikji.db 는 v1 로 신규 생성(README).
   if (!db.prepare('PRAGMA table_info(fact_revisions)').all().some((c) => c.name === 'base_version')) {
     db.exec('ALTER TABLE fact_revisions ADD COLUMN base_version INTEGER NOT NULL DEFAULT 0');
+  }
+  if (!db.prepare('PRAGMA table_info(outbox)').all().some((c) => c.name === 'lease_token')) {
+    db.exec('ALTER TABLE outbox ADD COLUMN lease_token TEXT');
   }
 
   // 모든 논리 쓰기는 BEGIN IMMEDIATE (seq 할당·insert 원자화, P1-1).
@@ -366,6 +370,52 @@ export function openStore(dbPath) {
       }
     }
     return { processed: done };
+  }
+
+  // ── async 임베딩 consumer (실 임베더 HttpEmbedder 용): lease(tx) → await embed(tx 밖) → commit(tx). ──
+  //  asyncEmbedFn(text) → Promise<{dim,buf,embedderId,embedderVer}>. tx 가 await 를 가로지르지 않음(node:sqlite 동기).
+  async function processEmbeddingsAsync(ns, asyncEmbedFn, { max = 50, leaseMs = 30000 } = {}) {
+    const now0 = Date.now();
+    const cand = db.prepare(`SELECT outbox_id FROM outbox WHERE namespace_id=? AND derivation_type='embedding'
+        AND (status='pending' OR (status='leased' AND lease_until < ?))
+        AND (next_retry_at IS NULL OR next_retry_at <= ?) LIMIT ?`).all(ns, now0, now0, max);
+    let done = 0;
+    for (const { outbox_id } of cand) {
+      // lease token 발급(Codex #3): claim 이 소유권을 잡고, commit/retry 는 **같은 토큰일 때만** 반영.
+      // 만료 lease 를 남이 재claim 하면 토큰이 바뀌어 느린 이전 consumer 의 commit/retry 는 0행(무시).
+      const token = `lt_${crypto.randomBytes(12).toString('hex')}`;
+      const claim = db.prepare(`UPDATE outbox SET status='leased', lease_until=?, lease_token=?, attempt=attempt+1
+          WHERE namespace_id=? AND outbox_id=? AND (status='pending' OR (status='leased' AND lease_until < ?))`)
+        .run(now0 + leaseMs, token, ns, outbox_id, now0);
+      if (claim.changes !== 1) continue;
+      const row = db.prepare(`SELECT o.revision_id, r.text FROM outbox o JOIN fact_revisions r
+                                ON r.namespace_id=o.namespace_id AND r.revision_id=o.revision_id
+                               WHERE o.namespace_id=? AND o.outbox_id=?`).get(ns, outbox_id);
+      try {
+        const { dim, buf, embedderId, embedderVer } = await asyncEmbedFn(row.text);
+        tx(() => {
+          // 완료는 lease_token 이 아직 내 것일 때만(정확히 1행). 아니면 벡터도 쓰지 않는다.
+          const claimed = db.prepare("UPDATE outbox SET status='done', lease_token=NULL WHERE namespace_id=? AND outbox_id=? AND status='leased' AND lease_token=?").run(ns, outbox_id, token);
+          if (claimed.changes !== 1) return;   // 남이 재claim — 내 결과 폐기
+          db.prepare(`INSERT INTO fact_vectors(namespace_id,revision_id,dim,vector,embedder_id,embedder_ver)
+                      VALUES(?,?,?,?,?,?) ON CONFLICT(namespace_id,revision_id) DO UPDATE SET
+                        dim=excluded.dim, vector=excluded.vector, embedder_id=excluded.embedder_id, embedder_ver=excluded.embedder_ver`)
+            .run(ns, row.revision_id, dim, buf, embedderId, embedderVer);
+        });
+        done++;
+      } catch {
+        // 실패 반환도 내 lease 일 때만(남의 유효 lease 를 pending 으로 되돌리지 않음).
+        db.prepare("UPDATE outbox SET status='pending', lease_token=NULL, next_retry_at=? WHERE namespace_id=? AND outbox_id=? AND status='leased' AND lease_token=?").run(Date.now() + 5000, ns, outbox_id, token);
+      }
+    }
+    return { processed: done };
+  }
+
+  /** 임베딩 outbox 에 pending 또는 **만료 leased**(crash 회수) 있는 namespace 목록(백그라운드 워커용, Codex #2). */
+  function namespacesWithPendingEmbeddings({ limit = 100 } = {}) {
+    const now0 = Date.now();
+    return db.prepare(`SELECT DISTINCT namespace_id FROM outbox WHERE derivation_type='embedding'
+        AND (status='pending' OR (status='leased' AND lease_until < ?)) LIMIT ?`).all(now0, limit).map((r) => r.namespace_id);
   }
 
   // ── moderation 결정 (전이 제한: pending_review|quarantined 에서만 — approved/rejected 는 종결, Codex #7) ──
@@ -566,7 +616,8 @@ export function openStore(dbPath) {
   return {
     SCHEMA_VERSION, contentHash,
     ensureNamespace, getNamespace, insertApiKey, resolveKey,
-    writeFact, processEmbeddings, decideModeration, retractFact, confirmRevision, forgetFact,
+    writeFact, processEmbeddings, processEmbeddingsAsync, namespacesWithPendingEmbeddings,
+    decideModeration, retractFact, confirmRevision, forgetFact,
     getHead, listActive, activeApprovedRevisions, searchableRevisions, getVector, countActiveRefs,
     listPending, findActiveByContentHash, markDisputed, recordImport,
     audit, recordConsent, close,

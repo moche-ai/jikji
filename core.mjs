@@ -11,6 +11,8 @@ import crypto from 'node:crypto';
 import { MOD, STATUS } from './store.mjs';
 import { packVector, unpackVector, cosine } from './embed.mjs';
 import { emit, notionalCost, labelHash } from './telemetry.mjs';
+import { bm25Scores, rrfFuse, classifyHard } from './search.mjs';
+import { admit } from './gpu.mjs';
 
 // injection 패턴(risk signal — 승인 근거 아님)
 const INJECTION_PATTERNS = [
@@ -40,7 +42,9 @@ function canonical(obj) {
 }
 
 export class MemoryCore {
-  constructor(store, embedder, { logger = null } = {}) { this.store = store; this.embedder = embedder; this.logger = logger; }
+  constructor(store, embedder, { logger = null, reranker = null } = {}) {
+    this.store = store; this.embedder = embedder; this.reranker = reranker; this.logger = logger;
+  }
 
   ensureTenant(namespaceId, ownerScope, policy = { auto_approve: true, default_no_train: true }) {
     return this.store.ensureNamespace(namespaceId, ownerScope, policy);
@@ -58,6 +62,21 @@ export class MemoryCore {
   _embedFn() {
     const emb = this.embedder;
     return (text) => { const [v] = emb.embed([text]); return { dim: emb.dim, buf: packVector(v), embedderId: emb.id, embedderVer: emb.ver }; };
+  }
+
+  // GPU admission 캐시(검색 경로). 스캐폴드(동기·GPU무필요)는 항상 true — nvidia-smi 호출 안 함.
+  // 실 임베더/리랭커는 admit 실패 시 검색이 GPU 를 안 때리게 back-off(→ bm25 폴백). 5초 캐시로 지연 최소화.
+  //  ★참고: 진짜 무간섭 enforcement 는 GPU 서비스(jikji-embed) 측 admission/queue 가 정본(Codex #4).
+  //    이 client-side 게이트는 협조적 back-off — 서비스 측 게이트를 대체하지 않는다.
+  async _gpuAdmitted() {
+    const usesGpu = this.embedder?.isAsync || this.reranker?.tier === 'reranker';
+    if (!usesGpu) return true;
+    const now = Date.now();
+    if (this._admitCache && (now - this._admitCache.at) < 5000) return this._admitCache.ok;
+    let ok = false;
+    try { ok = (await admit()).admit; } catch { ok = false; }
+    this._admitCache = { at: now, ok };
+    return ok;
   }
 
   // ── WRITE (authorType = ctx 봉인, payload 불신) ──
@@ -94,8 +113,9 @@ export class MemoryCore {
     });
 
     // 임베딩은 outbox consumer 가 — 실패해도 write 는 성공(pending 재시도). best-effort.
+    // 동기 스캐폴드 임베더만 인라인 드레인. 실 임베더(async)는 백그라운드 워커(worker.mjs)가 처리(요청경로 무차단).
     if (moderationState === MOD.APPROVED && !res.idempotent_replay) {
-      try { this.store.processEmbeddings(ctx.namespaceId, this._embedFn()); } catch { /* pending 유지 */ }
+      if (!this.embedder.isAsync) { try { this.store.processEmbeddings(ctx.namespaceId, this._embedFn()); } catch { /* pending 유지 */ } }
       // 모순검출(feature flag, 기본 OFF — 기준선 대비 개선 검증 후 승격). 애매 충돌 = disputed 양쪽 보존.
       const policy = this.store.getNamespace(ctx.namespaceId)?.policy || {};
       if (policy.contradiction_detection) {
@@ -114,9 +134,10 @@ export class MemoryCore {
 
   // 새 리비전과 가장 유사한 다른 active fact(같은 scope, cosine≥임계, 다른 내용) → disputed 양쪽 보존.
   // scope 는 새 리비전 자신의 fact scope 에서 도출(update 든 create 든 정확 — Codex #6).
-  _detectContradiction(ns, newRevisionId, threshold = 0.85) {
+  _detectContradiction(ns, newRevisionId, threshold = null) {
     const nv = this.store.getVector(ns, newRevisionId);
     if (!nv) return null;
+    if (threshold === null) threshold = this.store.getNamespace(ns)?.policy?.contradiction_threshold ?? 0.85;
     const all = this.store.searchableRevisions(ns);
     const self = all.find((r) => r.revision_id === newRevisionId);
     if (!self) return null;                                 // 승인 head 아니면 검출 안 함
@@ -139,8 +160,9 @@ export class MemoryCore {
     return null;
   }
 
-  // ── SEARCH (서버측 쿼리 최적화 {task_context, need, location}) ──
-  search(ctx, { task_context = '', need = '', location = '', k = 8 } = {}) {
+  // ── SEARCH (서버측 쿼리 최적화 {task_context, need, location}) — 하이브리드 BM25+dense → RRF → (선택)리랭커 ──
+  //  async: 실 임베더(KURE-v1)·리랭커(Qwen3)는 HTTP(await). 스캐폴드는 동기지만 인터페이스 통일.
+  async search(ctx, { task_context = '', need = '', location = '', k = 8 } = {}) {
     requireScope(ctx, 'retrieve');
     const t0 = Date.now();
     for (const [n, v] of [['task_context', task_context], ['need', need], ['location', location]]) {
@@ -151,28 +173,74 @@ export class MemoryCore {
     const queryText = [need, task_context, location].filter((s) => s && s.trim()).join(' \n ').trim();
     if (!queryText) { const e = new Error('empty_query'); e.code = 422; throw e; } // 빈 질의 = 랜덤 top-k 방지(P1-8)
 
-    const [qv] = this.embedder.embed([queryText]);
     const rows = this.store.searchableRevisions(ctx.namespaceId);   // active+disputed head, quarantine/pending 제외
-    const scored = [];
-    for (const r of rows) {
-      const v = this.store.getVector(ctx.namespaceId, r.revision_id);
-      if (!v) continue;
-      const score = cosine(qv, unpackVector(v.vector, v.dim));
-      scored.push({
-        fact: r.text, fact_id: r.fact_id, revision_id: r.revision_id,
-        fact_confidence: r.fact_confidence ?? null, retrieval_score: +score.toFixed(4),
-        validity_status: r.status,                          // active | disputed (설명가능성: temporal 유효성 분리)
-        conflict_set_id: r.conflict_set_id || null,          // disputed 는 충돌묶음 id 로 모델이 판단
-        scope_kind: r.scope_kind,
-        source: [{ revision_id: r.revision_id }], retrieval_reasons: ['dense_lexical'],
-      });
+    const byId = new Map(rows.map((r) => [r.revision_id, r]));
+
+    // GPU admission(실 임베더/리랭커 사용 시): 압력이면 dense/rerank 를 건너뛰고 bm25 폴백(협조적 back-off, Codex #4).
+    const admitted = await this._gpuAdmitted();
+
+    // ② dense: 쿼리 임베딩(await — 실모델 HTTP 가능) + 저장 벡터 cosine.
+    //  - 차원 불일치(임베더 버전 변경) 후보는 dense 생략(bm25 커버). cosine≤0(무관/음수)은 dense 순위 제외(Codex #5).
+    let denseScores = new Map();
+    let denseOk = true;
+    if (!this.embedder.isAsync || admitted) {
+      try {
+        const [qv] = await this.embedder.embed([queryText]);
+        const qdim = qv.length;
+        for (const r of rows) {
+          const v = this.store.getVector(ctx.namespaceId, r.revision_id);
+          if (!v || v.dim !== qdim) continue;               // 벡터 없음/차원 불일치 → dense 생략
+          const c = cosine(qv, unpackVector(v.vector, v.dim));
+          if (c > 0) denseScores.set(r.revision_id, c);      // 무관/음수 후보는 dense 순위 부여 안 함
+        }
+      } catch { denseOk = false; }   // 임베더 장애 = dense 생략, bm25 로 fail-open
+    } else { denseOk = false; }      // GPU 압력 = dense 생략(무간섭 back-off)
+
+    // ② bm25(lexical, on-the-fly — per-namespace 소규모).
+    const bm25 = bm25Scores(queryText, rows.map((r) => ({ id: r.revision_id, text: r.text })));
+
+    // RRF 융합(dense ⊕ bm25). 둘 다 비면 후보 없음.
+    const fused = rrfFuse([denseScores, bm25].filter((m) => m.size > 0));
+    let order = [...fused.keys()].sort((a, b) => fused.get(b) - fused.get(a));
+
+    // ④ 리랭커 계층(feature flag + 어려운 질의만). GPU 리랭커는 admission 통과 시만. 실패 = fail-open(융합 순서 유지).
+    const policy = this.store.getNamespace(ctx.namespaceId)?.policy || {};
+    let tier = denseOk ? 'hybrid' : 'bm25';
+    let rerankedSet = null;
+    const rerankAllowed = this.reranker && (this.reranker.tier !== 'reranker' || admitted);
+    if (rerankAllowed && policy.reranker && classifyHard(denseScores)) {
+      const topN = order.slice(0, 20).map((id) => ({ id, text: byId.get(id).text }));
+      try {
+        const rs = await this.reranker.rerank(queryText, topN);
+        const rr = topN.map((d, i) => [d.id, Number(rs[i]) || 0]).sort((a, b) => b[1] - a[1]);
+        order = [...rr.map(([id]) => id), ...order.filter((id) => !topN.some((d) => d.id === id))];
+        rerankedSet = new Set(topN.map((d) => d.id));
+        tier = 'reranker';
+      } catch { /* fail-open: 융합 순서 유지 */ }
     }
-    scored.sort((a, b) => b.retrieval_score - a.retrieval_score);
-    const results = scored.slice(0, kk);
-    emit({ event: 'memory.search', ok: true, result_count: results.length, tier: 'lexical',
+
+    const results = order.slice(0, kk).map((id) => {
+      const r = byId.get(id);
+      const reasons = [];
+      if (denseScores.has(id)) reasons.push('dense');
+      if (bm25.has(id)) reasons.push('bm25');
+      if (rerankedSet?.has(id)) reasons.push('reranked');
+      return {
+        fact: r.text, fact_id: r.fact_id, revision_id: r.revision_id,
+        fact_confidence: r.fact_confidence ?? null,
+        retrieval_score: +(fused.get(id) ?? 0).toFixed(6),   // RRF 점수(확률 아님)
+        validity_status: r.status,                            // active | disputed
+        conflict_set_id: r.conflict_set_id || null,
+        scope_kind: r.scope_kind,
+        source: [{ revision_id: r.revision_id }],
+        retrieval_reasons: reasons.length ? reasons : ['none'],   // 검색 파이프라인 trace(인과설명 아님)
+      };
+    });
+
+    emit({ event: 'memory.search', ok: true, result_count: results.length, tier,
       actor_pseudonym: ctx.actorPseudonym, namespace_hash: labelHash(ctx.namespaceId), latency_ms: Date.now() - t0,
-      input_units: queryText.length, cost_usd_notional: notionalCost({ tier: 'embed', inputUnits: queryText.length }) }, this.logger);
-    return { results, query_optimized: true };
+      input_units: queryText.length, cost_usd_notional: notionalCost({ tier: tier === 'reranker' ? 'rerank' : 'embed', inputUnits: queryText.length }) }, this.logger);
+    return { results, query_optimized: true, tier };
   }
 
   confirm(ctx, { revision_id }) {
@@ -228,7 +296,7 @@ export class MemoryCore {
     const state = map[decision];
     if (!state) { const e = new Error('bad_decision'); e.code = 422; throw e; }
     const r = this.store.decideModeration(ctx.namespaceId, revision_id, state, ctx.actorPseudonym || 'policy');
-    if (state === MOD.APPROVED) { try { this.store.processEmbeddings(ctx.namespaceId, this._embedFn()); } catch { /* pending 유지 */ } }
+    if (state === MOD.APPROVED && !this.embedder.isAsync) { try { this.store.processEmbeddings(ctx.namespaceId, this._embedFn()); } catch { /* pending 유지 */ } }
     this.store.audit(ctx.namespaceId, 'memory.review', ctx.actorPseudonym, { decision });
     emit({ event: 'memory.review', ok: true, moderation: state, actor_pseudonym: ctx.actorPseudonym, namespace_hash: labelHash(ctx.namespaceId) }, this.logger);
     return r;

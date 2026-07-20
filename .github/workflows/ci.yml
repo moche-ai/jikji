@@ -16,8 +16,10 @@ jobs:
         with:
           node-version: '22'
       - run: npm ci
-      - name: node --test (increment-1 security evidence)
+      - name: node --test (security + core + hybrid search evidence)
         run: node --test
+      - name: eval quality gate (Korean long-term memory v0 — no-regression floor)
+        run: node eval/run.mjs
 
   secret-scan:
     runs-on: ubuntu-latest

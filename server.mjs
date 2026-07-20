@@ -11,6 +11,8 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { z } from 'zod';
 import { openStore } from './store.mjs';
 import { makeEmbedder } from './embed.mjs';
+import { makeReranker } from './rerank.mjs';
+import { startEmbeddingWorker } from './worker.mjs';
 import { MemoryCore } from './core.mjs';
 import { actorPseudonym } from './telemetry.mjs';
 import { INSTRUCTIONS, TOOL_DESC } from './protocol.mjs';
@@ -24,7 +26,7 @@ function buildServer(core, ctx) {
   const server = new McpServer({ name: NAME, version: VERSION }, { instructions: INSTRUCTIONS });
   const ok = (o) => ({ content: [{ type: 'text', text: JSON.stringify(o) }] });
   const err = (e) => ({ isError: true, content: [{ type: 'text', text: JSON.stringify({ error: e.message, code: e.code || 500 }) }] });
-  const reg = (name, shape, fn) => server.registerTool(name, { description: TOOL_DESC[name], inputSchema: shape }, async (a) => { try { return ok(fn(a)); } catch (e) { return err(e); } });
+  const reg = (name, shape, fn) => server.registerTool(name, { description: TOOL_DESC[name], inputSchema: shape }, async (a) => { try { return ok(await fn(a)); } catch (e) { return err(e); } });
 
   reg('memory_search', { task_context: z.string().optional(), need: z.string().optional(), location: z.string().optional(), k: z.number().int().min(1).max(50).optional() },
     (a) => core.search(ctx, a));
@@ -65,7 +67,10 @@ export function createJikjiServer({ dbPath, allowedOrigins = [], prod = (process
   const hashToken = (t) => crypto.createHmac('sha256', secret).update(String(t)).digest('hex');
 
   const store = openStore(dbPath);
-  const core = new MemoryCore(store, makeEmbedder());
+  const embedder = makeEmbedder();
+  const core = new MemoryCore(store, embedder, { reranker: makeReranker() });
+  // 실 임베더(async)면 백그라운드 임베딩 워커 기동(요청경로 무차단, GPU admission 게이트 뒤). 스캐폴드는 인라인.
+  const stopWorker = embedder.isAsync ? startEmbeddingWorker(store, embedder) : null;
   const allowed = new Set(allowedOrigins);
 
   const httpServer = http.createServer(async (req, res) => {
@@ -112,7 +117,7 @@ export function createJikjiServer({ dbPath, allowedOrigins = [], prod = (process
     store.insertApiKey({ keyId, keyPrefix: t.slice(0, 10), keyHash: hashToken(t), namespaceId: ns, scopes });
     return { token: t, keyId };
   };
-  return { httpServer, store, core, mintApiKey };
+  return { httpServer, store, core, mintApiKey, stopWorker };
 }
 
 // ── 직접 실행(서비스) ──
@@ -127,7 +132,19 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const port = Number(process.env.JIKJI_PORT || 8107);
   const origins = (process.env.JIKJI_ALLOWED_ORIGINS || '').split(',').map((s) => s.trim()).filter(Boolean);
   try {
-    const { httpServer } = createJikjiServer({ dbPath, allowedOrigins: origins });
+    const { httpServer, store, stopWorker } = createJikjiServer({ dbPath, allowedOrigins: origins });
     httpServer.listen(port, host, () => console.log(`jikji-mcp listening http://${host}:${port} (db=${dbPath})`));
+    // 우아한 종료: worker stop(진행 틱 await) → server close → store close 순서(Codex #8).
+    let shuttingDown = false;
+    const shutdown = async (sig) => {
+      if (shuttingDown) return; shuttingDown = true;
+      console.log(`jikji-mcp shutting down (${sig})`);
+      try { if (stopWorker) await stopWorker(); } catch { /* noop */ }
+      await new Promise((r) => httpServer.close(r));
+      try { store.close(); } catch { /* noop */ }
+      process.exit(0);
+    };
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
+    process.on('SIGINT', () => shutdown('SIGINT'));
   } catch (e) { console.error('startup failed:', e.message); process.exit(1); }
 }

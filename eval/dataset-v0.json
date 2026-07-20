@@ -1,0 +1,352 @@
+{
+  "name": "jikji-korean-longterm-memory-v0",
+  "version": "0.0.1",
+  "note": "한국어 장기기억 평가셋 v0(MVP). 카테고리: 존칭·상대날짜·관계·동명이인·선호변경·부정문·한영혼용·신구충돌. 스캐폴드 임베더 기준선 — KURE-v1 승격 시 회귀 비교의 동일 척도.",
+  "cases": [
+    {
+      "id": "honorific-1",
+      "category": "존칭",
+      "setup": [
+        {
+          "text": "김민수 부장은 초밥을 아주 좋아한다"
+        },
+        {
+          "text": "이영희 대리는 파스타를 선호한다"
+        }
+      ],
+      "query": {
+        "need": "김민수 부장이 좋아하는 음식",
+        "task_context": "회식 메뉴 정하기"
+      },
+      "expect": {
+        "must_include": [
+          "초밥"
+        ],
+        "must_not_include": [
+          "파스타"
+        ]
+      }
+    },
+    {
+      "id": "honorific-2",
+      "category": "존칭",
+      "setup": [
+        {
+          "text": "박선생님께서는 아침 회의를 선호하신다"
+        },
+        {
+          "text": "최과장은 오후 회의를 선호한다"
+        }
+      ],
+      "query": {
+        "need": "박선생님이 선호하는 회의 시간대"
+      },
+      "expect": {
+        "must_include": [
+          "아침"
+        ]
+      }
+    },
+    {
+      "id": "reldate-1",
+      "category": "상대날짜",
+      "setup": [
+        {
+          "text": "팀 회의는 다음 주 화요일 오후 3시에 열린다"
+        },
+        {
+          "text": "코드 리뷰는 이번 주 목요일에 진행한다"
+        }
+      ],
+      "query": {
+        "need": "다음 주 화요일 회의 일정"
+      },
+      "expect": {
+        "must_include": [
+          "다음 주 화요일"
+        ]
+      }
+    },
+    {
+      "id": "reldate-2",
+      "category": "상대날짜",
+      "setup": [
+        {
+          "text": "프로젝트 마감은 다음 달 15일이다"
+        },
+        {
+          "text": "중간 점검은 이번 달 말에 한다"
+        }
+      ],
+      "query": {
+        "need": "프로젝트 마감 다음 달 15일"
+      },
+      "expect": {
+        "must_include": [
+          "다음 달 15일"
+        ]
+      }
+    },
+    {
+      "id": "relation-1",
+      "category": "관계",
+      "setup": [
+        {
+          "text": "장주의 여동생은 지민이다"
+        },
+        {
+          "text": "장주의 형은 태호이다"
+        }
+      ],
+      "query": {
+        "need": "장주의 여동생 이름"
+      },
+      "expect": {
+        "must_include": [
+          "지민"
+        ],
+        "must_not_include": [
+          "태호"
+        ]
+      }
+    },
+    {
+      "id": "relation-2",
+      "category": "관계",
+      "setup": [
+        {
+          "text": "우리 회사의 CTO는 강한나이다"
+        },
+        {
+          "text": "우리 회사의 CEO는 문재훈이다"
+        }
+      ],
+      "query": {
+        "need": "회사 CTO 강한나 역할"
+      },
+      "expect": {
+        "must_include": [
+          "강한나"
+        ]
+      }
+    },
+    {
+      "id": "homonym-1",
+      "category": "동명이인",
+      "setup": [
+        {
+          "text": "김철수는 백엔드 엔지니어이다",
+          "scope": "project",
+          "scope_ref": "repo:alpha"
+        },
+        {
+          "text": "김철수는 프론트엔드 디자이너이다",
+          "scope": "project",
+          "scope_ref": "repo:beta"
+        }
+      ],
+      "query": {
+        "need": "김철수 백엔드 엔지니어"
+      },
+      "expect": {
+        "must_include": [
+          "백엔드"
+        ]
+      }
+    },
+    {
+      "id": "homonym-2",
+      "category": "동명이인",
+      "setup": [
+        {
+          "text": "이준호는 마케팅 팀장이다"
+        },
+        {
+          "text": "이준호는 대학 동기이며 의사이다"
+        }
+      ],
+      "query": {
+        "need": "이준호 마케팅 팀장"
+      },
+      "expect": {
+        "must_include": [
+          "마케팅"
+        ]
+      }
+    },
+    {
+      "id": "prefchange-1",
+      "category": "선호변경",
+      "setup": [
+        {
+          "text": "내가 좋아하는 커피는 아메리카노이다",
+          "ref": "coffee"
+        },
+        {
+          "update_of": "coffee",
+          "text": "이제 내가 좋아하는 커피는 카페라떼이다"
+        }
+      ],
+      "query": {
+        "need": "내가 지금 좋아하는 커피"
+      },
+      "expect": {
+        "must_include": [
+          "카페라떼"
+        ],
+        "must_not_include": [
+          "아메리카노"
+        ]
+      }
+    },
+    {
+      "id": "prefchange-2",
+      "category": "선호변경",
+      "setup": [
+        {
+          "text": "선호하는 에디터는 vim 이다",
+          "ref": "editor"
+        },
+        {
+          "update_of": "editor",
+          "text": "선호하는 에디터를 vscode 로 바꿨다"
+        }
+      ],
+      "query": {
+        "need": "선호하는 에디터 vscode"
+      },
+      "expect": {
+        "must_include": [
+          "vscode"
+        ],
+        "must_not_include": [
+          "vim 이다"
+        ]
+      }
+    },
+    {
+      "id": "negation-1",
+      "category": "부정문",
+      "setup": [
+        {
+          "text": "나는 유당불내증이라 우유를 마시지 못한다"
+        },
+        {
+          "text": "나는 오렌지 주스를 즐겨 마신다"
+        }
+      ],
+      "query": {
+        "need": "우유를 마시지 못한다 유당불내증"
+      },
+      "expect": {
+        "must_include": [
+          "마시지 못한다"
+        ]
+      }
+    },
+    {
+      "id": "negation-2",
+      "category": "부정문",
+      "setup": [
+        {
+          "text": "이 프로젝트에서는 외부 API 를 사용하지 않기로 했다"
+        },
+        {
+          "text": "이 프로젝트는 내부 라이브러리만 쓴다"
+        }
+      ],
+      "query": {
+        "need": "외부 API 사용하지 않기로 결정"
+      },
+      "expect": {
+        "must_include": [
+          "사용하지 않"
+        ]
+      }
+    },
+    {
+      "id": "codeswitch-1",
+      "category": "한영혼용",
+      "setup": [
+        {
+          "text": "제 favorite 프로그래밍 language 는 Python 입니다"
+        },
+        {
+          "text": "저는 Java 도 조금 다룰 줄 압니다"
+        }
+      ],
+      "query": {
+        "need": "favorite 프로그래밍 language Python"
+      },
+      "expect": {
+        "must_include": [
+          "Python"
+        ]
+      }
+    },
+    {
+      "id": "codeswitch-2",
+      "category": "한영혼용",
+      "setup": [
+        {
+          "text": "우리 deployment 는 Docker 컨테이너로 GKE 에 올린다"
+        },
+        {
+          "text": "로컬 개발은 docker-compose 를 쓴다"
+        }
+      ],
+      "query": {
+        "need": "deployment Docker GKE 배포"
+      },
+      "expect": {
+        "must_include": [
+          "GKE"
+        ]
+      }
+    },
+    {
+      "id": "conflict-1",
+      "category": "신구충돌",
+      "policy": {
+        "contradiction_detection": true,
+        "contradiction_threshold": 0.7
+      },
+      "setup": [
+        {
+          "text": "내 사무실은 3층 301호이다"
+        },
+        {
+          "text": "내 사무실은 3층 305호이다"
+        }
+      ],
+      "query": {
+        "need": "내 사무실 3층 호수"
+      },
+      "expect": {
+        "expect_disputed": true
+      }
+    },
+    {
+      "id": "conflict-2",
+      "category": "신구충돌",
+      "policy": {
+        "contradiction_detection": true,
+        "contradiction_threshold": 0.7
+      },
+      "setup": [
+        {
+          "text": "우리 팀 스탠드업은 매일 오전 10시이다"
+        },
+        {
+          "text": "우리 팀 스탠드업은 매일 오전 11시이다"
+        }
+      ],
+      "query": {
+        "need": "팀 스탠드업 시간 오전"
+      },
+      "expect": {
+        "expect_disputed": true
+      }
+    }
+  ]
+}
