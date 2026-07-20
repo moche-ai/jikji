@@ -18,13 +18,32 @@
 
 ```jsonc
 // mcp.json — connect any MCP client (Claude Code, Cursor, …)
-{ "mcpServers": { "jikji": { "url": "http://127.0.0.1:8107/mcp",
-    "headers": { "Authorization": "Bearer jk_…" } } } }
+{ "mcpServers": { "jikji": { "url": "https://mcp.moche.ai/mcp",
+    "headers": { "Authorization": "Bearer jku_…" } } } }
 ```
 
 **Search before a task, remember after** — see [`AGENTS.md`](AGENTS.md) for the operating protocol, or
 jump to the numbers below. Named after *Jikji*, the world's oldest book printed with movable metal type
 (Korea, 1377) — the original technology for making memory permanent.
+
+## Quickstart (hosted beta)
+
+1. **Sign in** at [app.moche.ai](https://app.moche.ai) (Google or an invite code).
+2. **Issue an API key** — the account menu → *API 키* (or `app.moche.ai/jikji/keys`). You get a
+   `jku_…` token, shown once. (Closed beta: first 5 testers, keys valid ~1 month with no usage caps.)
+3. **Connect your agent** — paste the token into your MCP client config:
+
+   ```jsonc
+   { "mcpServers": { "jikji": { "url": "https://mcp.moche.ai/mcp",
+       "headers": { "Authorization": "Bearer jku_YOUR_TOKEN" } } } }
+   ```
+
+   Or hand this repo + your token to your coding agent and say *"set up the jikji MCP memory server"* —
+   it can follow [`AGENTS.md`](AGENTS.md) and [`clients/`](clients/) to wire it up (Claude Code hooks,
+   Cursor rules). That's it — the agent now searches before tasks and remembers after.
+
+   > Self-hosting instead? Run the loopback server (below) and point the URL at
+   > `http://127.0.0.1:8107/mcp`.
 
 ## What it does
 

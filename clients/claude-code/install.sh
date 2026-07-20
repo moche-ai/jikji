@@ -5,12 +5,12 @@
 # connect time. Export JIKJI_TOKEN in your shell yourself (mint it with bin/mint-key.mjs).
 #
 # Usage:
-#   JIKJI_URL=http://127.0.0.1:8107/mcp bash clients/claude-code/install.sh [target_project_dir]
+#   JIKJI_URL=https://mcp.moche.ai/mcp bash clients/claude-code/install.sh [target_project_dir]
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TARGET="${1:-$PWD}"
-URL="${JIKJI_URL:-http://127.0.0.1:8107/mcp}"
+URL="${JIKJI_URL:-https://mcp.moche.ai/mcp}"
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
 mkdir -p "$TARGET/.claude"
 

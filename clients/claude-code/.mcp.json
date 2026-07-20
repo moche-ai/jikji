@@ -2,7 +2,7 @@
   "mcpServers": {
     "jikji": {
       "type": "http",
-      "url": "http://127.0.0.1:8107/mcp",
+      "url": "https://mcp.moche.ai/mcp",
       "headers": {
         "Authorization": "Bearer ${JIKJI_TOKEN}"
       }
