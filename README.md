@@ -1,17 +1,31 @@
-# Jikji (직지)
+<h1 align="center">Jikji &nbsp;·&nbsp; 직지</h1>
 
-**Your memory, owned by you, portable across every AI.**
+<p align="center"><b>One memory. Every agent. Owned by you.</b></p>
 
-Jikji is a Korean-first personal memory layer for AI agents — a structured memory core that any AI
-tool can share through the [Model Context Protocol](https://modelcontextprotocol.io) (MCP).
+<p align="center">
+  A personal memory layer for AI agents — a structured memory that any tool shares over the
+  <a href="https://modelcontextprotocol.io">Model Context Protocol</a>. Korean-first, English on par,
+  multimodal, and yours in a single file.
+</p>
 
-> Named after *Jikji*, the world's oldest extant book printed with movable metal type
-> (Korea, 1377) — the original technology for making memory permanent.
+<p align="center">
+  <a href="https://github.com/moche-ai/jikji/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/moche-ai/jikji/actions/workflows/ci.yml/badge.svg"></a>
+  <img alt="MCP" src="https://img.shields.io/badge/Model_Context_Protocol-ready-3ddc84">
+  <img alt="Node" src="https://img.shields.io/badge/node-%E2%89%A522-339933">
+  <img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-blue">
+  <img alt="deps" src="https://img.shields.io/badge/direct_deps-2-brightgreen">
+  <img alt="database" src="https://img.shields.io/badge/store-node%3Asqlite%20(1%20file)-informational">
+</p>
 
-> **Agents:** [`AGENTS.md`](AGENTS.md) is the mandatory operating protocol — **search before every
-> task, remember after, invalidate/confirm to keep memory true.** Don't rely on the model choosing to
-> comply; install the strongest enforcement layer your runtime supports (Claude Code hooks / Cursor
-> rules / gateway) from [`clients/`](clients/).
+```jsonc
+// mcp.json — connect any MCP client (Claude Code, Cursor, …)
+{ "mcpServers": { "jikji": { "url": "http://127.0.0.1:8107/mcp",
+    "headers": { "Authorization": "Bearer jk_…" } } } }
+```
+
+**Search before a task, remember after** — see [`AGENTS.md`](AGENTS.md) for the operating protocol, or
+jump to the numbers below. Named after *Jikji*, the world's oldest book printed with movable metal type
+(Korea, 1377) — the original technology for making memory permanent.
 
 ## What it does
 
