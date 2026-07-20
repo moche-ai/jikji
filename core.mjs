@@ -246,12 +246,14 @@ export class MemoryCore {
   confirm(ctx, { revision_id }) {
     requireScope(ctx, 'retrieve');
     const r = this.store.confirmRevision(ctx.namespaceId, revision_id);
+    if (r.ok) this.store.audit(ctx.namespaceId, 'memory.confirm', ctx.actorPseudonym);   // 내구성 KPI(감사는 forget 캐스케이드 안 됨)
     emit({ event: 'memory.confirm', ok: r.ok, actor_pseudonym: ctx.actorPseudonym, namespace_hash: labelHash(ctx.namespaceId) }, this.logger);
     return r;
   }
   invalidate(ctx, { fact_id, reason = null }) {
     requireScope(ctx, 'write');
     const r = this.store.retractFact(ctx.namespaceId, fact_id, reason);
+    this.store.audit(ctx.namespaceId, 'memory.invalidate', ctx.actorPseudonym);
     emit({ event: 'memory.invalidate', ok: true, actor_pseudonym: ctx.actorPseudonym, namespace_hash: labelHash(ctx.namespaceId) }, this.logger);
     return r;
   }
@@ -318,6 +320,31 @@ export class MemoryCore {
     this.store.audit(ctx.namespaceId, 'memory.import', ctx.actorPseudonym, { units: units.length, imported });
     emit({ event: 'memory.import', ok: true, result_count: imported, actor_pseudonym: ctx.actorPseudonym, namespace_hash: labelHash(ctx.namespaceId) }, this.logger);
     return { import_id, units: units.length, imported, results };
+  }
+
+  /** M4 KPI(품질·운영·절감 추정) — per-namespace, 로컬 집계. 대시보드 위젯용. */
+  kpis(ctx) {
+    requireScope(ctx, 'retrieve');
+    const k = this.store.kpis(ctx.namespaceId);
+    const a = k.actions || {};
+    // 전부 audit_log 기반(내구성 — forget FK 캐스케이드로 사라지지 않음). search 는 로컬 미집계(계측 :5491 정본).
+    const writes = a['memory.write'] || 0;
+    const reviews = a['memory.review'] || 0;
+    const forgets = a['memory.forget'] || 0;
+    const contradictions = a['memory.contradiction'] || 0;
+    const confirms = a['memory.confirm'] || 0;
+    const retracts = a['memory.invalidate'] || 0;
+    // 절감 토큰 추정(정직 라벨): 확인된 재사용 1건당 대략적 재설명 회피분. 실측 아님.
+    const AVG_TOKENS_PER_MEMORY = 60;
+    const saved_tokens_estimate = confirms * AVG_TOKENS_PER_MEMORY;
+    const invalidate_ratio = writes ? +(retracts / writes).toFixed(3) : 0;
+    const out = {
+      active: k.active, pending: k.pending, quarantined: k.quarantined, disputed_sets: k.disputed_sets,
+      writes, reviews, forgets, contradictions, confirms, retracts,
+      invalidate_ratio, saved_tokens_estimate,
+    };
+    emit({ event: 'memory.kpi', ok: true, actor_pseudonym: ctx.actorPseudonym, namespace_hash: labelHash(ctx.namespaceId), result_count: k.active }, this.logger);
+    return out;
   }
 
   /** 다이제스트 export(신뢰↑) — 활성 fact 를 사람용 md 로. 내용은 오너 namespace 만. */

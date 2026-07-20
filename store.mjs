@@ -208,6 +208,18 @@ CREATE TABLE IF NOT EXISTS audit_log (
   namespace_id TEXT NOT NULL, seq INTEGER NOT NULL, action TEXT NOT NULL, actor_pseudonym TEXT, meta TEXT, at INTEGER NOT NULL,
   PRIMARY KEY (namespace_id, seq)
 );
+
+-- 베타 invite 코드(발급=운영자, 리딤=키 발급). 발송은 유저 게이트 — 여기선 코드 생성/리딤만.
+CREATE TABLE IF NOT EXISTS invites (
+  code         TEXT PRIMARY KEY,
+  namespace_id TEXT NOT NULL,
+  scopes       TEXT NOT NULL,
+  max_uses     INTEGER NOT NULL DEFAULT 1,
+  used         INTEGER NOT NULL DEFAULT 0,
+  created_at   INTEGER NOT NULL,
+  expires_at   INTEGER,
+  note         TEXT
+);
 `;
 
 export const STATUS = Object.freeze({ ACTIVE: 'active', DISPUTED: 'disputed', SUPERSEDED: 'superseded', RETRACTED: 'retracted' });
@@ -619,10 +631,60 @@ export function openStore(dbPath) {
     return db.prepare(base).all(ns, MOD.APPROVED);
   }
 
+  // ── M4: KPI 집계(로컬 테이블 — per-namespace 대시보드용, 계측 :5491 과 별개) ──
+  function kpis(ns) {
+    const actionRows = db.prepare('SELECT action, COUNT(*) c FROM audit_log WHERE namespace_id=? GROUP BY action').all(ns);
+    const evRows = db.prepare('SELECT type, COUNT(*) c FROM fact_events WHERE namespace_id=? GROUP BY type').all(ns);
+    const actions = Object.fromEntries(actionRows.map((a) => [a.action, a.c]));
+    const events = Object.fromEntries(evRows.map((e) => [e.type, e.c]));
+    const active = db.prepare(`SELECT COUNT(*) c FROM facts f JOIN fact_revisions r ON r.namespace_id=f.namespace_id AND r.revision_id=f.head_revision_id
+                               WHERE f.namespace_id=? AND r.status=?`).get(ns, STATUS.ACTIVE).c;
+    const pending = db.prepare('SELECT COUNT(*) c FROM moderation WHERE namespace_id=? AND state=?').get(ns, MOD.PENDING).c;
+    const quarantined = db.prepare('SELECT COUNT(*) c FROM moderation WHERE namespace_id=? AND state=?').get(ns, MOD.QUARANTINED).c;
+    const disputed = db.prepare("SELECT COUNT(DISTINCT set_id) c FROM conflict_sets WHERE namespace_id=?").get(ns).c;
+    return { active, pending, quarantined, disputed_sets: disputed, actions, events };
+  }
+
+  // ── M4: invites ──
+  function createInvite({ code, namespaceId, scopes, maxUses = 1, expiresAt = null, note = null }) {
+    db.prepare('INSERT INTO invites(code,namespace_id,scopes,max_uses,used,created_at,expires_at,note) VALUES(?,?,?,?,0,?,?,?)')
+      .run(code, namespaceId, scopes.join(','), maxUses, Date.now(), expiresAt, note);
+  }
+  /** 리딤: 유효하면 {namespaceId, scopes} 반환 + used++ (원자적). 무효면 null. */
+  function redeemInvite(code) {
+    return tx(() => {
+      const r = db.prepare('SELECT * FROM invites WHERE code=?').get(code);
+      if (!r) return null;
+      if (r.expires_at && r.expires_at < Date.now()) return null;
+      if (r.used >= r.max_uses) return null;
+      const upd = db.prepare('UPDATE invites SET used=used+1 WHERE code=? AND used<max_uses').run(code);
+      if (upd.changes !== 1) return null;                 // 경쟁 소진
+      return { namespaceId: r.namespace_id, scopes: (r.scopes || '').split(',').filter(Boolean) };
+    });
+  }
+  function listInvites() {
+    return db.prepare('SELECT code, namespace_id, scopes, max_uses, used, created_at, expires_at, note FROM invites ORDER BY created_at DESC').all();
+  }
+  /** 리딤 + 키 발급을 **한 tx** 로(Codex #1 — 소진/발급 원자성). 무효면 null. */
+  function redeemInviteWithKey(code, { keyId, keyPrefix, keyHash }) {
+    return tx(() => {
+      const r = db.prepare('SELECT * FROM invites WHERE code=?').get(code);
+      if (!r) return null;
+      if (r.expires_at && r.expires_at < Date.now()) return null;
+      if (r.used >= r.max_uses) return null;
+      const upd = db.prepare('UPDATE invites SET used=used+1 WHERE code=? AND used<max_uses').run(code);
+      if (upd.changes !== 1) return null;
+      const scopes = (r.scopes || '').split(',').filter(Boolean);
+      db.prepare(`INSERT INTO api_keys(key_id,key_prefix,key_hash,namespace_id,scopes,created_at,expires_at,rotated_from)
+                  VALUES(?,?,?,?,?,?,?,?)`).run(keyId, keyPrefix, keyHash, r.namespace_id, scopes.join(','), Date.now(), null, null);
+      return { namespaceId: r.namespace_id, scopes };
+    });
+  }
+
   function close() { db.close(); }
 
   return {
-    SCHEMA_VERSION, contentHash,
+    SCHEMA_VERSION, contentHash, kpis, createInvite, redeemInvite, redeemInviteWithKey, listInvites,
     ensureNamespace, getNamespace, insertApiKey, resolveKey, revokeApiKey, listApiKeys,
     writeFact, processEmbeddings, processEmbeddingsAsync, namespacesWithPendingEmbeddings,
     decideModeration, retractFact, confirmRevision, forgetFact,
