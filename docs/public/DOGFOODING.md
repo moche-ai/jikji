@@ -33,6 +33,22 @@ should get a `--scopes retrieve` key.
 - Auto-extracted memories (author_type `assistant`) land in `pending_review`; approve them with
   `memory_review` (or set the namespace policy to `auto_approve`).
 
+## Failure cases as procedural memory (don't regress)
+
+Jikji is where development lessons live so agents don't repeat mistakes or revert to a superseded
+approach. When a session hits a bug, a wrong turn, or an approach that got replaced, store it:
+
+```
+memory_write(text: "[lesson] <what went wrong> → <what to do instead>",
+             kind: "procedural", scope_kind: "project", scope_ref: "jikji-dev")
+```
+
+Because every memory is embedded, the search-first step surfaces the relevant lesson **semantically**
+before a similar task — e.g. a search for "how to speed up reranker inference" returns the lesson that
+the 3× speedup came from the serving stack (vLLM), not the seq-cls head. The reranker ranks the exact
+lesson to the top even when the query shares no surface tokens with it. This turns each past failure
+into a guardrail against the same failure recurring.
+
 ## What we watch
 
 Telemetry (`source=jikji`, content-free) surfaces search adoption, re-search rate, write/approval
