@@ -9,7 +9,6 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/moche-ai/jikji/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/moche-ai/jikji/actions/workflows/ci.yml/badge.svg"></a>
   <img alt="MCP" src="https://img.shields.io/badge/Model_Context_Protocol-ready-3ddc84">
   <img alt="Node" src="https://img.shields.io/badge/node-%E2%89%A522-339933">
   <img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-blue">

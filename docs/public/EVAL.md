@@ -2,7 +2,7 @@
 
 Jikji selects retrieval models by **blind A/B on a held-out eval**, single quality tier for everyone
 (no per-price or per-difficulty quality differentiation; the reranker runs on every query). The eval
-sets live in `eval/` and the gate runs in CI (`eval/run.mjs`).
+sets live in `eval/` and the gate is `eval/run.mjs` (run it locally / in your own CI).
 
 ## Eval sets
 
