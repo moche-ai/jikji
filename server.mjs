@@ -79,6 +79,13 @@ export function createJikjiServer({ dbPath, allowedOrigins = [], prod = (process
   const hashToken = (t) => crypto.createHmac('sha256', secret).update(String(t)).digest('hex');
   // 통합 ID(unified account): Bearer 'jku_…' → 공유 authz projection 리졸브. 'jk_…' → 자체 store(HMAC).
   const authzDbPath = process.env.JIKJI_AUTHZ_DB || './data/jikji-authz.db';
+  // 내부 대시보드용 서버간 토큰(loopback + 이 토큰). identity-app 웹 대시보드가 namespace별 통계를 프록시.
+  // prod 에서 미설정 = 내부 엔드포인트 비활성(fail-closed). dev 는 로컬 기본값.
+  const internalToken = process.env.JIKJI_INTERNAL_TOKEN || (prod ? null : 'dev-jikji-internal-token');
+  const safeEq = (a, b) => {
+    const ba = Buffer.from(String(a)); const bb = Buffer.from(String(b));
+    return ba.length === bb.length && crypto.timingSafeEqual(ba, bb);
+  };
 
   const store = openStore(dbPath);
   const embedder = makeEmbedder();
@@ -99,6 +106,23 @@ export function createJikjiServer({ dbPath, allowedOrigins = [], prod = (process
       if (req.method === 'GET' && url.pathname === '/healthz') {
         res.writeHead(200, { 'content-type': 'application/json' });
         return res.end(JSON.stringify({ ok: true, service: NAME, version: VERSION }));
+      }
+      // 내부 대시보드(loopback + JIKJI_INTERNAL_TOKEN) — identity-app 웹 대시보드가 namespace별 통계 조회.
+      // 키 인증이 아니라 서버간 토큰. namespace 는 신뢰된 caller(app, jikji_subject 소유)가 지정.
+      if (url.pathname === '/internal/dashboard') {
+        if (req.method !== 'GET') { res.writeHead(405, { 'content-type': 'application/json', allow: 'GET' }); return res.end(JSON.stringify({ error: 'method_not_allowed' })); }
+        const t = (req.headers.authorization || '').startsWith('Bearer ') ? req.headers.authorization.slice(7) : '';
+        if (!internalToken || !safeEq(t, internalToken)) { res.writeHead(401, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ error: 'unauthorized' })); }
+        const ns = url.searchParams.get('namespace');
+        if (!ns || typeof ns !== 'string' || ns.length > 200) { res.writeHead(422, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ error: 'bad_namespace' })); }
+        const dctx = { namespaceId: ns, scopes: ['retrieve'], authorType: 'self', actorPseudonym: null };
+        try {
+          const usage = core.usage(dctx);
+          const kpi = core.kpis(dctx);
+          const memories = core.list(dctx, { limit: 20 }).items.map((m) => ({ fact_id: m.fact_id, text: String(m.text ?? '').slice(0, 280), scope_kind: m.scope_kind, status: m.status }));
+          res.writeHead(200, { 'content-type': 'application/json' });
+          return res.end(JSON.stringify({ usage, kpi, memories }));
+        } catch { res.writeHead(500, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ error: 'internal_error' })); }
       }
       if (url.pathname !== '/mcp') { res.writeHead(404, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ error: 'not_found' })); }
       // Origin allowlist (있을 때만)
