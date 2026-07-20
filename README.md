@@ -36,8 +36,25 @@ Short version — every point is verifiable in this repo (see [`docs/public/WHY-
 - **Fast, self-hosted** — hybrid BM25 + dense + RRF + a reranker on *every* query; measured `memory_search` ≈ **223 ms** end-to-end on local GPU (no per-call external API tax).
 - **Quality, measured** — no-regression gate on a Korean long-term-memory benchmark; time/contradiction handled (supersede + disputed), not guessed at write time.
 - **Saves tokens** — recall a confirmed fact instead of re-explaining it, and inject only the *relevant* memories, not the whole history.
+- **Doesn't repeat mistakes** — failures are stored as procedural lessons, retrieved *before* the next attempt, and self-corrected via update/invalidate. [Worked example](docs/public/BENCHMARKS.md#4-regression-prevention--remembering-mistakes-worked-example).
 - **Multimodal** — cross-modal text ↔ image recall in one unified vector space (a capability general memory services don't offer).
 - **Yours** — a single portable SQLite file, Markdown export/import, full lineage, Apache-2.0. No lock-in.
+
+## By the numbers
+
+Measured/derived in this repo (full method + tables in [`docs/public/BENCHMARKS.md`](docs/public/BENCHMARKS.md)):
+
+| | |
+|---|---|
+| **Search latency** | **~223 ms** end-to-end (8B embed → BM25+dense+RRF → 8B rerank), warm |
+| **Throughput** | ~10 searches/sec sustained; comfortable for **10–20** closed-beta, ~50–100 bursty users |
+| **Token savings (recall)** | top-8 recall ≈ **~200 tokens, flat** vs history that grows — **~7× / ~19× / ~37×** fewer at 10 / 25 / 50-message sessions |
+| **Retrieval eval** | **top-1 = 1.00**, contamination 0, across 8 Korean long-term-memory categories (no-regression floor 0.85) |
+| **Models** | 8B embedder (**4096-dim**) + 8B reranker (BF16); embedder FP8, ~lossless |
+| **Infra** | one `node:sqlite` file — **no external vector/graph DB** |
+
+*Honest scope:* the eval sets are small smoke tests (correctness/regression guard, not headroom); token
+figures are derived from measured memory sizes with stated assumptions. See the doc for how to reproduce.
 
 ## Architecture — core ≠ entry point
 
