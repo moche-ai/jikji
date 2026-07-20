@@ -16,6 +16,7 @@ import { startEmbeddingWorker } from './worker.mjs';
 import { MemoryCore } from './core.mjs';
 import { actorPseudonym } from './telemetry.mjs';
 import { makeResolveBearer, probeAuthzProjection } from './authz.mjs';
+import { makeRateLimiter } from './ratelimit.mjs';
 import { INSTRUCTIONS, TOOL_DESC } from './protocol.mjs';
 
 const NAME = 'jikji';
@@ -93,6 +94,12 @@ export function createJikjiServer({ dbPath, allowedOrigins = [], prod = (process
   // 실 임베더(async)면 백그라운드 임베딩 워커 기동(요청경로 무차단, GPU admission 게이트 뒤). 스캐폴드는 인라인.
   const stopWorker = embedder.isAsync ? startEmbeddingWorker(store, embedder) : null;
   const resolveBearer = makeResolveBearer({ store, hashToken, authzDbPath });
+  // rate-limit/백프레셔: 검색=8B embed+rerank(공유 GPU)라 폭주 보호. 테넌트(namespace)별 토큰버킷 + 글로벌 in-flight.
+  const limiter = makeRateLimiter({
+    maxInflight: Number(process.env.JIKJI_MAX_INFLIGHT || 16),
+    ratePerMin: Number(process.env.JIKJI_RATE_RPM || 120),
+    burst: Number(process.env.JIKJI_RATE_BURST || 30),
+  });
   // 부팅 probe(비치명): projection 없으면 통합키 인증만 fail-closed, 자체 store 는 정상.
   if (!probeAuthzProjection(authzDbPath)) console.error(`[jikji] authz projection unavailable at ${authzDbPath} — unified (jku_) keys will fail-closed; native keys OK`);
   const allowed = new Set(allowedOrigins);
@@ -134,6 +141,11 @@ export function createJikjiServer({ dbPath, allowedOrigins = [], prod = (process
       const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
       const resolved = resolveBearer(token);
       if (!resolved) { res.writeHead(401, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ error: 'unauthorized' })); }
+      // rate-limit/백프레셔(테넌트별). 초과 = 429 + Retry-After(에이전트가 백오프). 슬롯은 응답 close 시 반환.
+      const gate = limiter.take(resolved.namespaceId);
+      if (!gate.ok) { res.writeHead(429, { 'content-type': 'application/json', 'retry-after': String(gate.retryAfter) }); return res.end(JSON.stringify({ error: 'rate_limited', reason: gate.reason, retry_after: gate.retryAfter })); }
+      let rlReleased = false; const rlRelease = () => { if (!rlReleased) { rlReleased = true; limiter.release(); } };
+      res.once('close', rlRelease);
       // namespace·authorType 봉인(owner MCP = self). 클라이언트가 못 바꿈.
       const ctx = { namespaceId: resolved.namespaceId, scopes: resolved.scopes, authorType: 'self', actorPseudonym: actorPseudonym(resolved.keyId) };
 
