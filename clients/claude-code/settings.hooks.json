@@ -1,0 +1,20 @@
+{
+  "_comment": "Merge these into your Claude Code settings.json (project .claude/settings.json or ~/.claude/settings.json). Replace CLIENTS_DIR with the absolute path to clients/claude-code.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          { "type": "command", "command": "CLIENTS_DIR/hooks/session-start.sh", "timeout": 8 }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "CLIENTS_DIR/hooks/stop.sh", "timeout": 5 }
+        ]
+      }
+    ]
+  }
+}

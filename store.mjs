@@ -259,6 +259,14 @@ export function openStore(dbPath) {
     db.prepare('UPDATE api_keys SET last_used_at=? WHERE key_id=?').run(Date.now(), r.key_id);
     return { keyId: r.key_id, namespaceId: r.namespace_id, scopes: (r.scopes || '').split(',').filter(Boolean) };
   }
+  /** 키 폐기(수명주기). 이미 폐기됐거나 없으면 false. */
+  function revokeApiKey(keyId) {
+    const r = db.prepare('UPDATE api_keys SET revoked_at=? WHERE key_id=? AND revoked_at IS NULL').run(Date.now(), keyId);
+    return r.changes === 1;
+  }
+  function listApiKeys(namespaceId) {
+    return db.prepare('SELECT key_id, key_prefix, namespace_id, scopes, created_at, expires_at, last_used_at, revoked_at FROM api_keys WHERE namespace_id=? ORDER BY created_at DESC').all(namespaceId);
+  }
 
   // ── head CAS (expected_version, P0-1) — tx 안에서만 ──
   function setHeadCAS(ns, factId, revisionId, expectedVersion) {
@@ -615,7 +623,7 @@ export function openStore(dbPath) {
 
   return {
     SCHEMA_VERSION, contentHash,
-    ensureNamespace, getNamespace, insertApiKey, resolveKey,
+    ensureNamespace, getNamespace, insertApiKey, resolveKey, revokeApiKey, listApiKeys,
     writeFact, processEmbeddings, processEmbeddingsAsync, namespacesWithPendingEmbeddings,
     decideModeration, retractFact, confirmRevision, forgetFact,
     getHead, listActive, activeApprovedRevisions, searchableRevisions, getVector, countActiveRefs,
