@@ -41,8 +41,10 @@ export class HttpReranker {
   }
 }
 
-/** env 기반 리랭커 팩토리. JIKJI_RERANK_URL 있으면 Http, 아니면 스캐폴드. */
+/** env 기반 리랭커 팩토리. JIKJI_RERANK_URL 있으면 실 리랭커(전 질의 적용), 없으면 **null**.
+ *  ★품질: 리랭커는 A/B 승자 실모델일 때만 적용 — 스캐폴드(약한 overlap)를 품질처럼 전 질의 적용하지 않는다
+ *  (스캐폴드는 테스트에서 명시 생성해 플러밍만 검증). 실 리랭커 미설정 = RRF 하이브리드(KURE-v1)로 충분. */
 export function makeReranker(env = process.env) {
   if (env.JIKJI_RERANK_URL) return new HttpReranker(env.JIKJI_RERANK_URL);
-  return new ScaffoldReranker();
+  return null;
 }

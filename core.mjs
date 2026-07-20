@@ -184,11 +184,15 @@ export class MemoryCore {
     const fused = rrfFuse([denseScores, bm25].filter((m) => m.size > 0));
     let order = [...fused.keys()].sort((a, b) => fused.get(b) - fused.get(a));
 
-    // ④ 리랭커 계층(feature flag + 어려운 질의만). GPU 리랭커는 admission 통과 시만. 실패 = fail-open(융합 순서 유지).
+    // ④ 대형 리랭커 — ★품질 단일 등급: 기본 = **전 질의 적용**(2026-07-20 유저 확정). 티어·난이도 차등 금지.
+    //   스킵(classifyHard=easy)은 평가셋에서 '리랭커 유무 결과 동일'이 증명된 구간만 opt-in(policy.rerank_skip_easy)
+    //   — 지연 최적화이지 품질 차등 아님. 리랭커 장애 = fail-open(융합 순서 유지).
     const policy = this.store.getNamespace(ctx.namespaceId)?.policy || {};
     let tier = denseOk ? 'hybrid' : 'bm25';
     let rerankedSet = null;
-    if (this.reranker && policy.reranker && classifyHard(denseScores)) {   // 리랭커 장애=fail-open(융합 순서 유지)
+    const rerankOn = this.reranker && policy.reranker !== false;               // 기본 ON(명시 false 만 끔)
+    const doRerank = rerankOn && (policy.rerank_skip_easy ? classifyHard(denseScores) : true);
+    if (doRerank) {
       const topN = order.slice(0, 20).map((id) => ({ id, text: byId.get(id).text }));
       try {
         const rs = await this.reranker.rerank(queryText, topN);
