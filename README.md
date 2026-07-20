@@ -74,16 +74,21 @@ Early development — a working local (loopback) MVP:
 - **Retrieval** — hybrid BM25 + dense + RRF with an optional reranker tier, measured by a Korean
   long-term-memory eval with a no-regression gate (`eval/`).
 - **MCP** — official SDK Streamable HTTP with scoped API keys, plus Claude Code / Cursor rule packs.
-- **Dashboard** — a small local UI to list, search, review, delete, import/export, and see KPIs.
+- **Dashboard** — a small local UI to list, search, review, delete, import/export, see KPIs, and a
+  **memory map** (graph of related memories).
+- **Gateway** — an OpenAI-compatible proxy (`base_url` swap) that auto-retrieves memories with
+  cache-aware injection (fail-open) and opt-in async auto-write; plus a LangGraph adapter.
+- **Real embedder** — a KURE-v1 (MIT) service (`embed-service/`) behind the `HttpEmbedder` interface,
+  measured against the eval: on a Korean semantic set, top-1 rises from a lexical 0.25 to **1.00**.
 
-Retrieval currently runs an honest lexical scaffold; real embedding models (KURE-v1) and the reranker
-(Qwen3) swap in behind a GPU-admission gate and must clear the eval floor. External exposure, real
-models, any paid tier, and beta invites are deliberately user-gated. Closed beta planned; watch this repo.
+Retrieval defaults to KURE-v1 when the embed service is configured, and to an honest lexical scaffold
+otherwise; the reranker (Qwen3) is a feature flag. External exposure, any paid tier, and beta invites
+are deliberately user-gated. Closed beta planned; watch this repo.
 
 ### Roadmap
 
-Memory-map visualization, an OpenAI-compatible gateway (cache-aware, fail-open), framework adapter
-packs, and on-device mode are next — developed alongside the closed beta.
+On-device mode, richer graph/temporal queries, and streaming auto-write in the gateway — developed
+alongside the closed beta.
 
 ## License
 

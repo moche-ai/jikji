@@ -67,7 +67,9 @@ export function rrfFuse(rankings, { k = RRF_K } = {}) {
 /** 기억 지도(L2 근사, M5): 활성 fact 를 노드로, 공유 유의미 토큰 ≥minShared 를 엣지로 온-디맨드 구성.
  *  docs = [{id, label, scope, status}]. 형태소기 없이 char-bigram 공유로 관계 추정(정직 라벨 — 근사).
  */
-export function buildGraph(docs, { minShared = 2, maxEdges = 500 } = {}) {
+export function buildGraph(docs, { minShared = 2, maxEdges = 500, maxNodes = 250 } = {}) {
+  // O(n^2) 쌍 비교 — 노드 수를 상한(계산 예산). 초과분은 지도에서 제외(정직 라벨).
+  if (docs.length > maxNodes) docs = docs.slice(0, maxNodes);
   const toks = docs.map((d) => new Set(tokenize(d.label).filter((t) => t.length >= 2)));
   const edges = [];
   for (let i = 0; i < docs.length; i++) {
