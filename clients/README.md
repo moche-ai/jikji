@@ -38,6 +38,6 @@ is on the roadmap, not in this pack.
 API keys are minted per namespace with `bin/mint-key.mjs` and scoped (`retrieve` / `write` / `admin`).
 The raw token is shown once; only its HMAC is stored. Read-only agents should get a `retrieve`-only key.
 
-External exposure (`mcp-host` via Cloudflare Tunnel) and MCP OAuth (2025-06-18: PKCE, audience
+External exposure (a public MCP hostname via a tunnel/reverse proxy) and MCP OAuth (2025-06-18: PKCE, audience
 validation, short-lived tokens, no token passthrough) are a **later, user-gated** step; today Jikji is
 loopback-only with API-key auth.

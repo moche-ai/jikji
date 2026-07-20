@@ -4,11 +4,16 @@ Real, reproducible numbers — measured on this repo, not marketing. Where a num
 the method and assumptions are stated so you can plug in your own. Hardware: one workstation GPU
 (RTX PRO 6000, sm_120), shared with other services. Models: **8B embedder (4096-dim) + 8B reranker**.
 
-> Honesty note: the retrieval eval sets below are small **smoke tests** — they check correctness and
-> guard regressions, not headroom. On these easy sets even the GPU-free lexical scaffold passes, so
-> they do **not** by themselves prove the 8B embedder's edge (that shows on paraphrase / true
-> cross-lingual retrieval; a harder public benchmark is on the roadmap). Latency and token numbers
-> are measured/derived and stand on their own.
+> Honesty note (read first):
+> - The **8B embedder + reranker + the ~223 ms latency are the optional GPU configuration**, not a
+>   default `npm install` checkout — which runs a GPU-free **lexical scaffold** (honestly low quality)
+>   with **no reranker**. Every 8B / 4096-dim / 223 ms / reranker figure below assumes the GPU
+>   embedder + reranker are configured (`JIKJI_EMBED_URL` / `JIKJI_RERANK_URL`).
+> - The retrieval eval sets are small **smoke tests** — they check correctness and guard regressions,
+>   not headroom. On these easy sets even the lexical scaffold passes, so they do **not** by themselves
+>   prove the 8B embedder's edge (that shows on paraphrase / true cross-lingual retrieval; a harder
+>   public benchmark is on the roadmap).
+> - Token figures are **derived** from measured memory sizes with stated assumptions — plug in yours.
 
 ---
 
@@ -110,7 +115,7 @@ The dashboard surfaces the count of such procedural lessons and confirmed reuses
 | | |
 |---|---|
 | Embedder | 8B class, **4096-dim** (native max for the 8B backbone) |
-| Reranker | 8B (Qwen3-VL-Reranker), **BF16 / not quantized** (precision-sensitive final ordering) |
+| Reranker | 8B (Qwen3-Reranker-8B), **BF16 / not quantized** (precision-sensitive final ordering) |
 | Embedder quantization | FP8 (E4M3) on native Blackwell tensor cores — ~2× BF16, ~lossless |
 | Multimodal | text **and** images in one unified 4096-dim space (cross-modal recall, KO/EN) |
 | Retrieval | BM25 (CJK char-bigram) + dense cosine → RRF fusion → reranker on **every** query |

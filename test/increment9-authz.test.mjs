@@ -1,6 +1,6 @@
 // jikji/test/increment9-authz.test.mjs — 통합 ID(unified account) read-path 소비자
 //
-// 계약: identity-app UNIFIED-ID-DESIGN §11 (Option D). app 이 공유 authz projection 의 writer,
+// 계약: 중앙 identity 앱 UNIFIED-ID-DESIGN §11 (Option D). app 이 공유 authz projection 의 writer,
 // jikji 는 read-only 룩업 + native 'jk_'(HMAC)는 현행 유지. 'jku_'(index2='u')는 native 'jk_'와 disjoint.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';

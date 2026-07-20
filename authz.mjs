@@ -1,8 +1,8 @@
 // jikji/authz.mjs — 통합 ID(unified account) read-path + 공통 Bearer 리졸버.
 //
-// 정본 계약: identity-app docs/UNIFIED-ID-DESIGN.md §9~11 (Option D, Codex 검토 반영).
-// identity-app(central-app)이 공유 authz projection 의 유일 writer. jikji 는 여기서 **read-only** 룩업만.
-// 레퍼런스 = identity-app backend/scripts/jikji-authz-reader.reference.mjs (이식 + 공통 resolveBearer·하드닝).
+// 통합 계정을 발급하는 중앙 identity 앱이 공유 authz projection 의 유일 writer이고,
+// jikji 는 여기서 **read-only** 룩업만 한다(Option D). 계약: 통합키(jku_)=SHA-256 projection,
+// 네이티브키(jk_)=자체 store HMAC. 아래 로직은 projection reader의 참조 구현을 이식·하드닝한 것.
 //
 // 키 라우팅(세 진입점 = server·gateway·dashboard 공통):
 //   Bearer 'jku_…' → 공유 projection SHA-256 룩업(read-only, fail-closed)     → namespace = jikji_subject

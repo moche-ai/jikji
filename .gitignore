@@ -9,3 +9,8 @@ __pycache__/
 *.sqlite
 *.db
 .venv/
+
+# SQLite sidecars (WAL/SHM/journal) — 저널이 *.db 무시를 우회하지 않게
+*.db-wal
+*.db-shm
+*.db-journal

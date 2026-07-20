@@ -36,9 +36,12 @@ Jikji treats memory as sensitive data and enforces it in code, with tests as evi
   memory and consenting to model improvement are **separate axes**.
 - **Review before it goes live.** Assistant-extracted or risky content lands in a review queue and is
   **not indexed** until approved. Write and retrieval are independently controllable.
-- **Secrets are refused, not stored.** API keys, tokens, private keys, JWTs and the like are detected
-  (with NFKC + zero-width-evasion normalization) and **rejected at write time** — the agent is told to
-  use a secret manager instead. Jikji never becomes a place credentials leak into.
+- **Common secret formats are refused, not stored.** API keys, tokens, private keys, JWTs and the like
+  are detected by pattern (with NFKC + zero-width-evasion normalization) and **rejected at write time**
+  — the agent is told to use a secret manager instead. This is **best-effort detection of common
+  formats**, not a guarantee that every possible secret is caught; but rejected content is never
+  logged, and the design keeps Jikji from becoming an easy place for well-known credential formats to
+  pile up.
 - **Prompt injection is quarantined.** Untrusted content that looks like an instruction is flagged and
   held for review, never silently promoted into your trusted memory.
 - **Tenant isolation is structural.** Every row is keyed by a composite `(namespace_id, id)`;

@@ -53,8 +53,10 @@ Measured/derived in this repo (full method + tables in [`docs/public/BENCHMARKS.
 | **Models** | 8B embedder (**4096-dim**) + 8B reranker (BF16); embedder FP8, ~lossless |
 | **Infra** | one `node:sqlite` file — **no external vector/graph DB** |
 
-*Honest scope:* the eval sets are small smoke tests (correctness/regression guard, not headroom); token
-figures are derived from measured memory sizes with stated assumptions. See the doc for how to reproduce.
+*Honest scope:* the **8B embedder + reranker + ~223 ms latency are the optional GPU config**, not a
+default checkout (which runs a GPU-free lexical scaffold, no reranker). The eval sets are small smoke
+tests (correctness/regression guard, not headroom); token figures are derived from measured memory
+sizes with stated assumptions. See the doc for how to reproduce.
 
 ## Architecture — core ≠ entry point
 

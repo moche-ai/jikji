@@ -22,6 +22,8 @@ import { INSTRUCTIONS, TOOL_DESC } from './protocol.mjs';
 const NAME = 'jikji';
 const VERSION = '0.0.1';
 const LOOPBACK = new Set(['127.0.0.1', '::1', 'localhost', '[::1]']);
+// 소켓 원격주소가 loopback 인가(Host 헤더 위조·DNS rebinding 방어 — dashboard.mjs 와 동일 강도).
+const isLoopbackAddr = (a) => !!a && (a === '127.0.0.1' || a === '::1' || a === '::ffff:127.0.0.1' || a.startsWith('127.'));
 const hostOf = (h) => String(h || '').replace(/:\d+$/, '').replace(/^\[|\]$/g, '');
 
 function buildServer(core, ctx) {
@@ -80,7 +82,7 @@ export function createJikjiServer({ dbPath, allowedOrigins = [], prod = (process
   const hashToken = (t) => crypto.createHmac('sha256', secret).update(String(t)).digest('hex');
   // 통합 ID(unified account): Bearer 'jku_…' → 공유 authz projection 리졸브. 'jk_…' → 자체 store(HMAC).
   const authzDbPath = process.env.JIKJI_AUTHZ_DB || './data/jikji-authz.db';
-  // 내부 대시보드용 서버간 토큰(loopback + 이 토큰). identity-app 웹 대시보드가 namespace별 통계를 프록시.
+  // 내부 대시보드용 서버간 토큰(loopback + 이 토큰). 중앙 identity 앱의 웹 대시보드가 namespace별 통계를 프록시.
   // prod 에서 미설정 = 내부 엔드포인트 비활성(fail-closed). dev 는 로컬 기본값.
   const internalToken = process.env.JIKJI_INTERNAL_TOKEN || (prod ? null : 'dev-jikji-internal-token');
   const safeEq = (a, b) => {
@@ -109,13 +111,16 @@ export function createJikjiServer({ dbPath, allowedOrigins = [], prod = (process
       const url = new URL(req.url || '/', 'http://internal');
       // Host 검증(loopback 전용, DNS rebinding 방어 — P1-5). healthz 포함 전 경로에 우선 적용:
       // JIKJI_ALLOW_NONLOOPBACK 로 외부 bind 해도 원격 Host 는 healthz 조차 노출되지 않는다.
-      if (!LOOPBACK.has(hostOf(req.headers.host))) { res.writeHead(403, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ error: 'host_forbidden' })); }
+      // 기본(loopback 전용)엔 소켓주소+Host 둘 다 검증. JIKJI_ALLOW_NONLOOPBACK=1(프록시 뒤 의도적 노출)이면 소켓검증 생략.
+      if ((process.env.JIKJI_ALLOW_NONLOOPBACK !== '1' && !isLoopbackAddr(req.socket?.remoteAddress)) || !LOOPBACK.has(hostOf(req.headers.host))) { res.writeHead(403, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ error: 'host_forbidden' })); }
       if (req.method === 'GET' && url.pathname === '/healthz') {
         res.writeHead(200, { 'content-type': 'application/json' });
         return res.end(JSON.stringify({ ok: true, service: NAME, version: VERSION }));
       }
-      // 내부 대시보드(loopback + JIKJI_INTERNAL_TOKEN) — identity-app 웹 대시보드가 namespace별 통계 조회.
-      // 키 인증이 아니라 서버간 토큰. namespace 는 신뢰된 caller(app, jikji_subject 소유)가 지정.
+      // 내부 대시보드 — 서버간 read 전용. ★신뢰경계(명시): loopback 강제(소켓+Host) + JIKJI_INTERNAL_TOKEN.
+      // namespace 는 caller 가 지정하므로, 이 토큰을 가진 loopback 프로세스(=인증 세션으로 namespace 를
+      // 서버측 도출하는 중앙 identity 앱)만 신뢰한다. 토큰 유출 시 cross-tenant read 가능 → 반드시 프로세스
+      // 로컬 시크릿으로 관리. 강한 격리(서명된 namespace assertion·토큰별 namespace 스코프)는 GA 하드닝.
       if (url.pathname === '/internal/dashboard') {
         if (req.method !== 'GET') { res.writeHead(405, { 'content-type': 'application/json', allow: 'GET' }); return res.end(JSON.stringify({ error: 'method_not_allowed' })); }
         const t = (req.headers.authorization || '').startsWith('Bearer ') ? req.headers.authorization.slice(7) : '';
