@@ -1,0 +1,12 @@
+[project]
+name = "jikji-embed"
+version = "0.0.1"
+description = "Jikji dense embedding service (KURE-v1) — the real embedder behind the HttpEmbedder interface"
+requires-python = ">=3.10"
+dependencies = [
+  "torch>=2.4",
+  "sentence-transformers>=3.0",
+]
+
+[tool.uv]
+# torch CUDA wheels are resolved from the default index; pin CUDA build via env if needed.

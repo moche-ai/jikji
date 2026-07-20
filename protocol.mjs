@@ -48,6 +48,8 @@ export const TOOL_DESC = {
     'Import an existing Markdown note as memories (onboarding); each unit passes the write gate. | 기존 md를 기억으로 임포트(온보딩).',
   memory_export_md:
     'Export active memories as a human-readable Markdown digest (portability/trust). | 활성 기억을 md 다이제스트로 export.',
+  memory_graph:
+    'Explore the memory map — related memories linked by shared terms (optionally focused on a need). | 기억 지도 — 공유 용어로 이어진 관련 기억 탐색.',
   memory_forget:
     'Permanently delete a fact; cascades to derivatives and returns a deletion receipt. | 사실 영구 삭제(파생 연쇄 + 삭제 receipt).',
 };

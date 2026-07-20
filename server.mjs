@@ -42,6 +42,7 @@ function buildServer(core, ctx) {
   reg('memory_import_md', { markdown: z.string(), source: z.string().optional(), scope_kind: z.enum(['user', 'workspace', 'project', 'session']).optional(), scope_ref: z.string().optional() },
     (a) => core.importMarkdown(ctx, { markdown: a.markdown, source: a.source, scopeKind: a.scope_kind, scopeRef: a.scope_ref }));
   reg('memory_export_md', { limit: z.number().int().min(1).max(5000).optional() }, (a) => core.exportMarkdown(ctx, a));
+  reg('memory_graph', { need: z.string().optional(), limit: z.number().int().min(1).max(500).optional() }, (a) => core.graph(ctx, a));
   reg('memory_forget', { fact_id: z.string(), reason: z.string().optional() }, (a) => core.forget(ctx, a));
   return server;
 }

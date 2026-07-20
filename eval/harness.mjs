@@ -10,6 +10,7 @@
 import { openStore } from '../store.mjs';
 import { makeEmbedder } from '../embed.mjs';
 import { makeReranker } from '../rerank.mjs';
+import { drainOnce } from '../worker.mjs';
 import { MemoryCore } from '../core.mjs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -48,6 +49,8 @@ async function runCase(core, c, k) {
       if (m.ref) ids[m.ref] = r.fact_id;
     }
   }
+  // 실 임베더(async)는 write 시 인라인 드레인 안 함 → 검색 전 임베딩 outbox 드레인(스캐폴드는 무영향).
+  if (core.embedder.isAsync) await drainOnce(core.store, core.embedder, { gpuGate: false });
   const res = await core.search(ctxOf(ns), { ...c.query, k });
   // top1_accuracy: 정답이 노이즈·distractor 를 제치고 top-1 로 랭크되는가(must_include ⊆ top-1) + must_not ∉ top-1.
   const top1 = res.results[0]?.fact || '';

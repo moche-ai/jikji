@@ -64,6 +64,26 @@ export function rrfFuse(rankings, { k = RRF_K } = {}) {
   return fused;
 }
 
+/** 기억 지도(L2 근사, M5): 활성 fact 를 노드로, 공유 유의미 토큰 ≥minShared 를 엣지로 온-디맨드 구성.
+ *  docs = [{id, label, scope, status}]. 형태소기 없이 char-bigram 공유로 관계 추정(정직 라벨 — 근사).
+ */
+export function buildGraph(docs, { minShared = 2, maxEdges = 500 } = {}) {
+  const toks = docs.map((d) => new Set(tokenize(d.label).filter((t) => t.length >= 2)));
+  const edges = [];
+  for (let i = 0; i < docs.length; i++) {
+    for (let j = i + 1; j < docs.length; j++) {
+      const shared = [];
+      for (const t of toks[i]) if (toks[j].has(t)) shared.push(t);
+      if (shared.length >= minShared) edges.push({ src: docs[i].id, dst: docs[j].id, weight: shared.length, shared: shared.slice(0, 6) });
+    }
+  }
+  edges.sort((a, b) => b.weight - a.weight);
+  const degree = new Map();
+  for (const e of edges.slice(0, maxEdges)) { degree.set(e.src, (degree.get(e.src) || 0) + 1); degree.set(e.dst, (degree.get(e.dst) || 0) + 1); }
+  const nodes = docs.map((d) => ({ ...d, degree: degree.get(d.id) || 0 }));
+  return { nodes, edges: edges.slice(0, maxEdges) };
+}
+
 /** 어려운 질의 판정(소형 라우터, 비용 절감): 후보 다수 + 상위 dense margin 작음 → 리랭커로. */
 export function classifyHard(denseScores, { minCandidates = 5, margin = 0.05 } = {}) {
   const vals = [...denseScores.values()].sort((a, b) => b - a);

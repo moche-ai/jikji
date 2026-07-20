@@ -22,7 +22,7 @@ async function main() {
   const k = Number(arg('k', '8'));
   const floor = Number(arg('floor', String(BASELINE_FLOOR)));
   const asJson = process.argv.includes('--json');
-  const dataset = JSON.parse(readFileSync(join(here, 'dataset-v0.json'), 'utf8'));
+  const dataset = JSON.parse(readFileSync(join(here, arg('dataset', 'dataset-v0.json')), 'utf8'));
   const m = await runEval(dataset, { k });
 
   if (asJson) { console.log(JSON.stringify(m, null, 2)); }

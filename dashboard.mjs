@@ -76,6 +76,7 @@ export function createDashboard({ dbPath, prod = (process.env.JIKJI_ENV === 'pro
   async function handle(route, ctx, body, url) {
     switch (route) {
       case 'GET /api/kpi': return core.kpis(ctx);
+      case 'GET /api/graph': return core.graph(ctx, { need: url.searchParams.get('need') || null, limit: Number(url.searchParams.get('limit') || 120) });
       case 'GET /api/memories': return core.list(ctx, { limit: Number(url.searchParams.get('limit') || 50) });
       case 'GET /api/pending': return core.pending(ctx);
       case 'GET /api/export': return core.exportMarkdown(ctx);
@@ -116,6 +117,7 @@ main{max-width:960px;margin:0 auto;padding:20px;display:grid;gap:18px}
  <section class="card"><div class="row"><b>승인 대기 (pending)</b><button class="ghost" onclick="loadPending()">새로고침</button></div><div id="pending"></div></section>
  <section class="card"><div class="row"><b>기억 목록</b><button class="ghost" onclick="loadMemories()">새로고침</button>
   <div style="flex:1"></div><button class="ghost" onclick="exportMd()">export md</button></div><div id="memories"></div></section>
+ <section class="card"><div class="row"><b>기억 지도</b><button class="ghost" onclick="loadGraph()">그리기</button><span class="mut">공유 용어로 이어진 관련 기억</span></div><div id="graph"></div></section>
  <section class="card"><b>md 임포트</b><textarea id="imp" rows="4" placeholder="- 이름은 …\\n- 선호는 …"></textarea>
   <div class="row" style="margin-top:8px"><button onclick="importMd()">임포트</button><span id="impmsg" class="mut"></span></div></section>
 </main>
@@ -133,6 +135,7 @@ async function forget(id){if(!confirm('영구 삭제(파생 연쇄)?'))return;aw
 async function review(id,d){await api('/api/review',{method:'POST',body:JSON.stringify({revision_id:id,decision:d})});refresh()}
 async function exportMd(){const e=await api('/api/export');const b=new Blob([e.markdown],{type:'text/markdown'});const u=URL.createObjectURL(b);const a=document.createElement('a');a.href=u;a.download='jikji-export.md';a.click()}
 async function importMd(){const md=document.getElementById('imp').value;if(!md)return;try{const r=await api('/api/import',{method:'POST',body:JSON.stringify({markdown:md})});document.getElementById('impmsg').textContent=r.imported+'/'+r.units+' 임포트';document.getElementById('imp').value='';refresh()}catch(e){alert(e.message)}}
+async function loadGraph(){try{const g=await api('/api/graph');const W=900,H=440,cx=W/2,cy=H/2,R=Math.min(cx,cy)-46;const n=g.nodes.slice(0,60);const pos={};n.forEach((nd,i)=>{const a=2*Math.PI*i/(n.length||1);pos[nd.id]=[cx+R*Math.cos(a),cy+R*Math.sin(a)]});const ids=new Set(n.map(x=>x.id));const lines=g.edges.filter(e=>ids.has(e.src)&&ids.has(e.dst)).map(e=>'<line x1="'+pos[e.src][0]+'" y1="'+pos[e.src][1]+'" x2="'+pos[e.dst][0]+'" y2="'+pos[e.dst][1]+'" stroke="#2f3947" stroke-width="'+Math.min(e.weight,4)+'"/>').join('');const dots=n.map(nd=>'<circle cx="'+pos[nd.id][0]+'" cy="'+pos[nd.id][1]+'" r="'+(4+Math.min(nd.degree,8))+'" fill="'+(nd.status==='disputed'?'#ffc14d':'#5b8cff')+'"><title>'+esc(nd.label)+'</title></circle>').join('');document.getElementById('graph').innerHTML='<svg width="100%" viewBox="0 0 '+W+' '+H+'" style="max-height:460px">'+lines+dots+'</svg><div class="mut">'+n.length+' 노드 · '+g.edges.length+' 엣지</div>'}catch(e){document.getElementById('graph').innerHTML='<div class="mut">'+esc(e.message)+'</div>'}}
 function refresh(){loadKpi();loadMemories();loadPending()}
 refresh();
 </script></body></html>`;

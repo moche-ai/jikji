@@ -52,7 +52,9 @@ async function protectedHealthy(urls, timeoutMs) {
 export async function admit({
   allowedGpus = (process.env.JIKJI_GPU_ALLOWED || '1,3').split(',').map((s) => Number(s.trim())).filter(Number.isFinite),
   minFreeVramMB = Number(process.env.JIKJI_GPU_MIN_FREE_MB || 6000),
-  utilCeilingPct = Number(process.env.JIKJI_GPU_UTIL_CEILING || 85),
+  // util 상한 기본 100(사실상 off): 상시 서빙 서버는 util 이 항상 ~100% 라 util 게이트는 오탐. 진짜 게이트 =
+  // 허용 GPU(1/3) + free VRAM 헤드룸 + 보호서비스 health. 엄격 운영은 JIKJI_GPU_UTIL_CEILING 로 조인다.
+  utilCeilingPct = Number(process.env.JIKJI_GPU_UTIL_CEILING || 100),
   protectedHealthUrls = (process.env.JIKJI_PROTECTED_HEALTH || '').split(',').map((s) => s.trim()).filter(Boolean),
   timeoutMs = 3000,
 } = {}) {
