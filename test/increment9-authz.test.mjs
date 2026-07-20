@@ -14,17 +14,17 @@ import { readAuthzProjection, probeAuthzProjection, makeResolveBearer } from '..
 
 const sha256 = (t) => crypto.createHash('sha256').update(String(t)).digest('hex');
 
-// 공유 projection 픽스처(app writer 스키마 v1) 생성.
+// 공유 projection 픽스처(app writer 스키마 v2 — account_status.plan 포함) 생성.
 function makeProjection(rows = [], accounts = []) {
   const p = join(tmpdir(), `jikji-authz-${crypto.randomBytes(6).toString('hex')}.db`);
   const db = new DatabaseSync(p);
-  db.exec('PRAGMA user_version = 1');
+  db.exec('PRAGMA user_version = 2');
   db.exec(`CREATE TABLE authz_keys(key_hash TEXT PRIMARY KEY, jikji_subject TEXT NOT NULL, key_prefix TEXT,
     scopes TEXT NOT NULL, status TEXT NOT NULL, issued_at INTEGER, expires_at INTEGER, rotated_from TEXT);
-    CREATE TABLE account_status(jikji_subject TEXT PRIMARY KEY, status TEXT NOT NULL);`);
+    CREATE TABLE account_status(jikji_subject TEXT PRIMARY KEY, status TEXT NOT NULL, plan TEXT);`);
   for (const r of rows) db.prepare('INSERT INTO authz_keys(key_hash,jikji_subject,key_prefix,scopes,status,issued_at,expires_at,rotated_from) VALUES(?,?,?,?,?,?,?,?)')
     .run(r.key_hash, r.jikji_subject, r.key_prefix ?? r.key_hash.slice(0, 12), r.scopes, r.status ?? 'active', r.issued_at ?? Date.now(), r.expires_at ?? null, null);
-  for (const a of accounts) db.prepare('INSERT INTO account_status(jikji_subject,status) VALUES(?,?)').run(a.jikji_subject, a.status);
+  for (const a of accounts) db.prepare('INSERT INTO account_status(jikji_subject,status,plan) VALUES(?,?,?)').run(a.jikji_subject, a.status, a.plan ?? null);
   db.close();
   return { path: p, cleanup: () => { try { rmSync(p); rmSync(p + '-wal'); rmSync(p + '-shm'); } catch {} } };
 }
@@ -42,7 +42,30 @@ test('jku_ 정상 해석: namespace=jikji_subject, scopes 파싱', () => {
   const { path, cleanup } = makeProjection([{ key_hash: sha256(tok), jikji_subject: 'subjA', scopes: 'retrieve,write' }]);
   try {
     const r = readAuthzProjection(path, tok);
-    assert.deepEqual(r, { jikjiSubject: 'subjA', scopes: ['retrieve', 'write'] });
+    assert.deepEqual(r, { jikjiSubject: 'subjA', scopes: ['retrieve', 'write'], plan: 'free' }); // plan 미설정 → free
+  } finally { cleanup(); }
+});
+
+test('요금제 반영: account_status.plan → interpretRow.plan (free 기본·beta 설정·unknown→free)', () => {
+  const betaTok = 'jku_' + crypto.randomBytes(32).toString('base64url');
+  const freeTok = 'jku_' + crypto.randomBytes(32).toString('base64url');
+  const bogusTok = 'jku_' + crypto.randomBytes(32).toString('base64url');
+  const { path, cleanup } = makeProjection(
+    [
+      { key_hash: sha256(betaTok), jikji_subject: 'bta', scopes: 'retrieve,write' },
+      { key_hash: sha256(freeTok), jikji_subject: 'fre', scopes: 'retrieve,write' },
+      { key_hash: sha256(bogusTok), jikji_subject: 'bog', scopes: 'retrieve' },
+    ],
+    [
+      { jikji_subject: 'bta', status: 'active', plan: 'beta' },
+      { jikji_subject: 'fre', status: 'active', plan: 'free' },
+      { jikji_subject: 'bog', status: 'active', plan: 'enterprise_x' }, // unknown → free
+    ],
+  );
+  try {
+    assert.equal(readAuthzProjection(path, betaTok).plan, 'beta');
+    assert.equal(readAuthzProjection(path, freeTok).plan, 'free');
+    assert.equal(readAuthzProjection(path, bogusTok).plan, 'free'); // 화이트리스트 밖 → least-privilege
   } finally { cleanup(); }
 });
 

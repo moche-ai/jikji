@@ -17,8 +17,9 @@
 import { DatabaseSync } from 'node:sqlite';
 import crypto from 'node:crypto';
 
-const SCHEMA_VERSION = 1;
+const MIN_SCHEMA_VERSION = 2;   // v2+ 요구(account_status.plan). 가법 마이그레이션은 >= 로 후방호환(writer 선행 배포).
 const ALLOWED_SCOPES = new Set(['retrieve', 'write']); // admin 은 projection 발급 없음
+const KNOWN_PLANS = new Set(['free', 'basic', 'pro', 'beta']); // projection plan 화이트리스트(unknown/null → free = least-privilege)
 
 function sha256(token) {
   return crypto.createHash('sha256').update(String(token)).digest('hex');
@@ -26,11 +27,11 @@ function sha256(token) {
 
 const LOOKUP_SQL =
   `SELECT k.jikji_subject AS jikji_subject, k.scopes AS scopes, k.status AS status, k.expires_at AS expires_at,
-          s.status AS acct_status
+          s.status AS acct_status, s.plan AS acct_plan
      FROM authz_keys k LEFT JOIN account_status s ON s.jikji_subject = k.jikji_subject
     WHERE k.key_hash = ?`;
 
-/** projection row → {jikjiSubject, scopes} | null. 전부 fail-closed(계약 §11 + Codex allowlist). */
+/** projection row → {jikjiSubject, scopes, plan} | null. 전부 fail-closed(계약 §11 + Codex allowlist). */
 function interpretRow(row) {
   if (!row) return null;                                     // 미스
   if (row.status !== 'active') return null;                  // revoked/미지원
@@ -46,7 +47,9 @@ function interpretRow(row) {
     scopes.push(p);
   }
   if (!scopes.length) return null;
-  return { jikjiSubject: row.jikji_subject, scopes };
+  // 요금제: writer 가 발급 시 확정(free/beta 등). null/unknown → free(least-privilege). namespace JIT 정책에 반영.
+  const plan = KNOWN_PLANS.has(row.acct_plan) ? row.acct_plan : 'free';
+  return { jikjiSubject: row.jikji_subject, scopes, plan };
 }
 
 function validTokenShape(token) {
@@ -58,7 +61,7 @@ export function probeAuthzProjection(dbPath) {
   let db;
   try {
     db = new DatabaseSync(dbPath, { readOnly: true });
-    if ((db.prepare('PRAGMA user_version').get()?.user_version ?? 0) !== SCHEMA_VERSION) return false;
+    if ((db.prepare('PRAGMA user_version').get()?.user_version ?? 0) < MIN_SCHEMA_VERSION) return false;
     db.prepare('SELECT 1 FROM authz_keys LIMIT 1').get();
     db.prepare('SELECT 1 FROM account_status LIMIT 1').get();
     return true;
@@ -79,7 +82,7 @@ export function readAuthzProjection(dbPath, token) {
   try {
     db = new DatabaseSync(dbPath, { readOnly: true });
     db.exec('PRAGMA busy_timeout = 2000');
-    if ((db.prepare('PRAGMA user_version').get()?.user_version ?? 0) !== SCHEMA_VERSION) return null;
+    if ((db.prepare('PRAGMA user_version').get()?.user_version ?? 0) < MIN_SCHEMA_VERSION) return null;
     return interpretRow(db.prepare(LOOKUP_SQL).get(sha256(token)));
   } catch {
     return null;                                             // 열기 실패·busy/locked·WAL/SHM 실패 → fail-closed
@@ -92,7 +95,7 @@ export function readAuthzProjection(dbPath, token) {
  * 공통 Bearer 리졸버 팩토리 — 세 진입점 공통. projection 연결·prepared statement 재사용(요청마다 open 금지).
  * @returns {(token:string|null)=>({namespaceId:string,scopes:string[],keyId:string}|null)}
  */
-export function makeResolveBearer({ store, hashToken, authzDbPath, ensurePolicy = { auto_approve: true, default_no_train: true, plan: 'beta' } }) {
+export function makeResolveBearer({ store, hashToken, authzDbPath, ensurePolicy = { auto_approve: true, default_no_train: true } }) {
   const ensured = new Set();          // subject 최초 provisioning 만 write(요청마다 write 금지)
   let db = null;
   let stmt = null;
@@ -102,7 +105,7 @@ export function makeResolveBearer({ store, hashToken, authzDbPath, ensurePolicy 
     try {
       db = new DatabaseSync(authzDbPath, { readOnly: true });
       db.exec('PRAGMA busy_timeout = 2000');
-      if ((db.prepare('PRAGMA user_version').get()?.user_version ?? 0) !== SCHEMA_VERSION) { closeDb(); return false; }
+      if ((db.prepare('PRAGMA user_version').get()?.user_version ?? 0) < MIN_SCHEMA_VERSION) { closeDb(); return false; }
       stmt = db.prepare(LOOKUP_SQL);
       return true;
     } catch { closeDb(); return false; }
@@ -128,8 +131,10 @@ export function makeResolveBearer({ store, hashToken, authzDbPath, ensurePolicy 
       if (!r) return null;                                   // fail-closed (miss 후 HMAC fallback 금지)
       const ownerScope = `unified:${r.jikjiSubject}`;
       // JIT provisioning — 최초 1회만 write. 실패 = 보안경계 미생성 → fail-closed(P1).
+      //   요금제(plan)는 writer(projection)가 발급 시 확정한 값을 주입 → 첫 생성 시 namespace 정책에 고정
+      //   (ensureNamespace 는 ON CONFLICT DO NOTHING — 기존 namespace 는 다운그레이드/변경되지 않음).
       if (!ensured.has(r.jikjiSubject)) {
-        try { store.ensureNamespace(r.jikjiSubject, ownerScope, ensurePolicy); }
+        try { store.ensureNamespace(r.jikjiSubject, ownerScope, { ...ensurePolicy, plan: r.plan }); }
         catch { return null; }
         ensured.add(r.jikjiSubject);
       }
