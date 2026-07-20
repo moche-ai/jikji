@@ -36,8 +36,18 @@ export const TOOL_DESC = {
     'Call when a retrieved memory was right and used (high-confidence signal). | 검색 기억이 맞고 쓰였을 때.',
   memory_invalidate:
     'Call when a stored memory is wrong; creates a retraction revision. | 틀린 기억 무효화(철회 리비전 생성).',
+  memory_update:
+    'Update a fact when its content changed; requires expected_version and supersedes the previous revision (no silent overwrite). | 내용 변경 시 supersede(expected_version 필수).',
   memory_list:
     'List active memories in the current namespace (management/inspection). | 현재 네임스페이스 활성 기억 목록.',
+  memory_pending:
+    'List memories awaiting review (pending_review) before they become active. | 승인 대기(저장 전 리뷰) 목록.',
+  memory_review:
+    'Approve / reject / quarantine a pending memory (approve indexes it). | 대기 기억 심의(approve=색인).',
+  memory_import_md:
+    'Import an existing Markdown note as memories (onboarding); each unit passes the write gate. | 기존 md를 기억으로 임포트(온보딩).',
+  memory_export_md:
+    'Export active memories as a human-readable Markdown digest (portability/trust). | 활성 기억을 md 다이제스트로 export.',
   memory_forget:
     'Permanently delete a fact; cascades to derivatives and returns a deletion receipt. | 사실 영구 삭제(파생 연쇄 + 삭제 receipt).',
 };

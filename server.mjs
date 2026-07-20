@@ -32,7 +32,14 @@ function buildServer(core, ctx) {
     (a) => core.write(ctx, { text: a.text, kind: a.kind, scopeKind: a.scope_kind, scopeRef: a.scope_ref, idempotencyKey: a.idempotency_key }));
   reg('memory_confirm', { revision_id: z.string() }, (a) => core.confirm(ctx, a));
   reg('memory_invalidate', { fact_id: z.string(), reason: z.string().optional() }, (a) => core.invalidate(ctx, a));
+  reg('memory_update', { fact_id: z.string(), text: z.string(), expected_version: z.number().int().min(0) },
+    (a) => core.update(ctx, { fact_id: a.fact_id, text: a.text, expectedVersion: a.expected_version }));
   reg('memory_list', { limit: z.number().int().min(1).max(200).optional(), offset: z.number().int().min(0).optional() }, (a) => core.list(ctx, a));
+  reg('memory_pending', { limit: z.number().int().min(1).max(200).optional(), offset: z.number().int().min(0).optional() }, (a) => core.pending(ctx, a));
+  reg('memory_review', { revision_id: z.string(), decision: z.enum(['approve', 'reject', 'quarantine']) }, (a) => core.review(ctx, a));
+  reg('memory_import_md', { markdown: z.string(), source: z.string().optional(), scope_kind: z.enum(['user', 'workspace', 'project', 'session']).optional(), scope_ref: z.string().optional() },
+    (a) => core.importMarkdown(ctx, { markdown: a.markdown, source: a.source, scopeKind: a.scope_kind, scopeRef: a.scope_ref }));
+  reg('memory_export_md', { limit: z.number().int().min(1).max(5000).optional() }, (a) => core.exportMarkdown(ctx, a));
   reg('memory_forget', { fact_id: z.string(), reason: z.string().optional() }, (a) => core.forget(ctx, a));
   return server;
 }

@@ -287,15 +287,17 @@ export function openStore(dbPath) {
         }
       }
       const now = Date.now();
-      const isUpdate = Boolean(factId) && Boolean(db.prepare('SELECT 1 FROM facts WHERE namespace_id=? AND fact_id=?').get(ns, factId));
+      // factId 제공 = update 의도. 존재하지 않으면 404(클라이언트 지정 id 로 신규 생성 금지 — Codex).
+      const existing = factId ? db.prepare('SELECT version FROM facts WHERE namespace_id=? AND fact_id=?').get(ns, factId) : null;
+      if (factId && !existing) { const e = new Error('fact_not_found'); e.code = 404; throw e; }
+      const isUpdate = Boolean(existing);
       const fid = factId || newId('fact');
       const rid = newId('rev');
       let baseVersion;
       if (isUpdate) {
         if (expectedVersion === null || expectedVersion === undefined) { const e = new Error('expected_version_required'); e.code = 428; throw e; }
         // 제출 시점 검증(P0-1): expectedVersion 이 현재 head version 과 일치해야 — 미래/과거 값 예약 방지.
-        const cur = db.prepare('SELECT version FROM facts WHERE namespace_id=? AND fact_id=?').get(ns, factId).version;
-        if (expectedVersion !== cur) { const e = new Error('version_conflict'); e.code = 409; throw e; }
+        if (expectedVersion !== existing.version) { const e = new Error('version_conflict'); e.code = 409; throw e; }
         baseVersion = expectedVersion;
       } else {
         db.prepare(`INSERT INTO facts(namespace_id,fact_id,head_revision_id,version,kind,scope_kind,scope_ref,created_at)
@@ -310,7 +312,14 @@ export function openStore(dbPath) {
         .run(ns, rid, moderationState, riskFlags ? JSON.stringify(riskFlags) : null);
 
       if (moderationState === MOD.APPROVED) {
+        // temporal supersede: 승인 update 는 이전 head 를 superseded 로 내리고 대체관계 기록(자동 LWW 아님 —
+        // 명시적 update 호출만 이 경로. 애매 충돌은 core 가 disputed 로 별도 처리).
+        const prevHead = isUpdate ? db.prepare('SELECT head_revision_id FROM facts WHERE namespace_id=? AND fact_id=?').get(ns, fid)?.head_revision_id : null;
         setHeadCAS(ns, fid, rid, baseVersion);          // pending/quarantine 은 head 미갱신
+        if (prevHead && prevHead !== rid) {
+          db.prepare('UPDATE fact_revisions SET status=? WHERE namespace_id=? AND revision_id=? AND status=?').run(STATUS.SUPERSEDED, ns, prevHead, STATUS.ACTIVE);
+          db.prepare('INSERT INTO revision_supersedes(namespace_id,revision_id,superseded_revision_id) VALUES(?,?,?) ON CONFLICT DO NOTHING').run(ns, rid, prevHead);
+        }
         enqueueOutbox(ns, rid, 'embedding');            // 임베딩은 outbox consumer 가(P0-3)
       }
       db.prepare('INSERT INTO fact_events(namespace_id,seq,fact_id,revision_id,type,at) VALUES(?,?,?,?,?,?)')
@@ -359,13 +368,17 @@ export function openStore(dbPath) {
     return { processed: done };
   }
 
-  // ── moderation 결정 ──
+  // ── moderation 결정 (전이 제한: pending_review|quarantined 에서만 — approved/rejected 는 종결, Codex #7) ──
   function decideModeration(ns, revisionId, state, reviewedBy = 'policy') {
     return tx(() => {
       // 승인 시 write 시점의 base_version 으로 CAS — 그 사이 fact 가 진행됐으면 stale 로 409(P0-1).
       const rev = db.prepare('SELECT fact_id, base_version FROM fact_revisions WHERE namespace_id=? AND revision_id=?').get(ns, revisionId);
       if (!rev) { const e = new Error('revision_not_found'); e.code = 404; throw e; }
-      db.prepare('UPDATE moderation SET state=?, reviewed_by=?, reviewed_at=? WHERE namespace_id=? AND revision_id=?').run(state, reviewedBy, Date.now(), ns, revisionId);
+      // 조건부 UPDATE: 현재 state 가 결정 가능 상태일 때만 1행 변경. approved/rejected 재결정 = 차단.
+      const upd = db.prepare(`UPDATE moderation SET state=?, reviewed_by=?, reviewed_at=?
+                              WHERE namespace_id=? AND revision_id=? AND state IN (?, ?)`)
+        .run(state, reviewedBy, Date.now(), ns, revisionId, MOD.PENDING, MOD.QUARANTINED);
+      if (upd.changes !== 1) { const e = new Error('moderation_transition_forbidden'); e.code = 409; throw e; }
       if (state === MOD.APPROVED) { setHeadCAS(ns, rev.fact_id, revisionId, rev.base_version); enqueueOutbox(ns, revisionId, 'embedding'); }
       return { revision_id: revisionId, moderation: state };
     });
@@ -432,6 +445,17 @@ export function openStore(dbPath) {
         .run(ns, jobId, reason, contentHash(factId).slice(0, 16), now);
       // FK CASCADE 로 fact_revisions→(vectors·outbox·moderation·supersedes·conflict) + fact_events 모두 삭제
       db.prepare('DELETE FROM facts WHERE namespace_id=? AND fact_id=?').run(ns, factId);
+      // conflict_set 위생(Codex #9): 멤버 삭제로 <2 남은 묶음 정리. 1명 생존 = disputed 해소(→active 복귀), 빈 묶음 = 제거.
+      for (const cs of db.prepare('SELECT set_id FROM conflict_sets WHERE namespace_id=?').all(ns)) {
+        const members = db.prepare('SELECT revision_id FROM conflict_members WHERE namespace_id=? AND set_id=?').all(ns, cs.set_id);
+        if (members.length >= 2) continue;
+        if (members.length === 1) {
+          // 남은 disputed head 를 active 로 복귀(상대가 사라져 더는 충돌 아님)
+          db.prepare('UPDATE fact_revisions SET status=? WHERE namespace_id=? AND revision_id=? AND status=?').run(STATUS.ACTIVE, ns, members[0].revision_id, STATUS.DISPUTED);
+          db.prepare('DELETE FROM conflict_members WHERE namespace_id=? AND set_id=?').run(ns, cs.set_id);
+        }
+        db.prepare('DELETE FROM conflict_sets WHERE namespace_id=? AND set_id=?').run(ns, cs.set_id);
+      }
       const refs = countActiveRefs(ns, factId, revIds);
       const verified = refs === 0;
       for (const store of ACTIVE_STORES) {
@@ -476,13 +500,75 @@ export function openStore(dbPath) {
       .run(ns, seqIn('consent_events', ns), subject, purpose, action, noticeVersion, source, Date.now()));
   }
 
+  // ── 증분2: pending inbox / disputed(모순) / import / dedup / 검색후보(active+disputed) ──
+
+  /** 저장 전 리뷰 큐 = moderation pending_review 인 리비전(승인 전 색인 안 됨). */
+  function listPending(ns, { limit = 100, offset = 0 } = {}) {
+    return db.prepare(`SELECT r.fact_id, r.revision_id, r.text, r.author_type, m.state, m.risk_flags, r.recorded_at
+                         FROM fact_revisions r
+                         JOIN moderation m ON m.namespace_id=r.namespace_id AND m.revision_id=r.revision_id
+                        WHERE r.namespace_id=? AND m.state=? ORDER BY r.recorded_at DESC LIMIT ? OFFSET ?`)
+      .all(ns, MOD.PENDING, limit, offset);
+  }
+
+  /** 동일 scope 활성 head 중 같은 content_hash — dedup 후보(중복 저장 방지). */
+  function findActiveByContentHash(ns, hash, scopeKind = null) {
+    const base = `SELECT r.fact_id, r.revision_id FROM facts f
+                    JOIN fact_revisions r ON r.namespace_id=f.namespace_id AND r.revision_id=f.head_revision_id
+                   WHERE f.namespace_id=? AND r.status=? AND r.content_hash=?`;
+    if (scopeKind) return db.prepare(base + ' AND f.scope_kind=?').get(ns, STATUS.ACTIVE, hash, scopeKind) || null;
+    return db.prepare(base).get(ns, STATUS.ACTIVE, hash) || null;
+  }
+
+  /** 두 리비전을 disputed 로 양쪽 보존 + conflict_set 묶음(자동 덮어쓰기 금지).
+   *  Codex #10: 삽입 전 두 리비전 모두 이 tenant 의 approved **active head** 인지 tx 안에서 검증. 아니면 전체 롤백. */
+  function markDisputed(ns, revIdA, revIdB) {
+    return tx(() => {
+      for (const rid of [revIdA, revIdB]) {
+        const ok = db.prepare(`SELECT 1 FROM facts f
+                                 JOIN fact_revisions r ON r.namespace_id=f.namespace_id AND r.revision_id=f.head_revision_id
+                                 JOIN moderation m ON m.namespace_id=r.namespace_id AND m.revision_id=r.revision_id
+                                WHERE f.namespace_id=? AND r.revision_id=? AND r.status=? AND m.state=?`)
+          .get(ns, rid, STATUS.ACTIVE, MOD.APPROVED);
+        if (!ok) { const e = new Error('dispute_requires_active_head'); e.code = 409; throw e; }
+      }
+      const setId = newId('cset'); const now = Date.now();
+      db.prepare('INSERT INTO conflict_sets(namespace_id,set_id,created_at) VALUES(?,?,?)').run(ns, setId, now);
+      for (const rid of [revIdA, revIdB]) {
+        db.prepare('INSERT INTO conflict_members(namespace_id,set_id,revision_id) VALUES(?,?,?) ON CONFLICT DO NOTHING').run(ns, setId, rid);
+        db.prepare('UPDATE fact_revisions SET status=? WHERE namespace_id=? AND revision_id=? AND status=?').run(STATUS.DISPUTED, ns, rid, STATUS.ACTIVE);
+      }
+      return { set_id: setId };
+    });
+  }
+
+  /** md 임포트 원장. */
+  function recordImport(ns, source, mapping) {
+    const id = newId('imp');
+    db.prepare('INSERT INTO imports(namespace_id,import_id,source,mapping,at) VALUES(?,?,?,?,?)').run(ns, id, source, JSON.stringify(mapping || {}), Date.now());
+    return { import_id: id };
+  }
+
+  /** 검색 후보 = active + disputed head (moderation approved). conflict_set_id 동봉(disputed 묶음 반환용). */
+  function searchableRevisions(ns, { scopeKind = null } = {}) {
+    const base = `SELECT r.fact_id, r.revision_id, r.text, r.fact_confidence, r.status, f.scope_kind, f.scope_ref,
+                    (SELECT cm.set_id FROM conflict_members cm WHERE cm.namespace_id=r.namespace_id AND cm.revision_id=r.revision_id LIMIT 1) AS conflict_set_id
+                    FROM facts f
+                    JOIN fact_revisions r ON r.namespace_id=f.namespace_id AND r.revision_id=f.head_revision_id
+                    JOIN moderation m ON m.namespace_id=r.namespace_id AND m.revision_id=r.revision_id
+                   WHERE f.namespace_id=? AND r.status IN ('active','disputed') AND m.state=?`;
+    if (scopeKind) return db.prepare(base + ' AND f.scope_kind=?').all(ns, MOD.APPROVED, scopeKind);
+    return db.prepare(base).all(ns, MOD.APPROVED);
+  }
+
   function close() { db.close(); }
 
   return {
     SCHEMA_VERSION, contentHash,
     ensureNamespace, getNamespace, insertApiKey, resolveKey,
     writeFact, processEmbeddings, decideModeration, retractFact, confirmRevision, forgetFact,
-    getHead, listActive, activeApprovedRevisions, getVector, countActiveRefs,
+    getHead, listActive, activeApprovedRevisions, searchableRevisions, getVector, countActiveRefs,
+    listPending, findActiveByContentHash, markDisputed, recordImport,
     audit, recordConsent, close,
   };
 }
